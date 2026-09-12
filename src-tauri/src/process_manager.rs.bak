@@ -1,0 +1,184 @@
+//! Gerenciador de processos: um processo por agente.
+//! Responsável por iniciar/parar/enviar input/redimensionar processos reais
+//! e por emitir eventos Tauri para o frontend.
+
+use crate::models::{Agent, Status};
+use crate::runtime::{LocalShellAdapter, ProcessHandle, RuntimeAdapter, RuntimeError};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter};
+
+/// Eventos emitidos ao frontend.
+pub const EVENT_AGENT_STARTED: &str = "agent_started";
+pub const EVENT_AGENT_OUTPUT: &str = "agent_output";
+pub const EVENT_AGENT_STOPPED: &str = "agent_stopped";
+pub const EVENT_AGENT_ERROR: &str = "agent_error";
+pub const EVENT_AGENT_STATUS_CHANGED: &str = "agent_status_changed";
+
+/// Payload de evento genérico: `{ agentId, data }`.
+#[derive(Clone, serde::Serialize)]
+pub struct AgentEvent {
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    pub data: String,
+}
+
+/// Gerenciador de processos em execução.
+pub struct ProcessManager {
+    /// Processos ativos, indexados por agent id.
+    pub processes: Mutex<HashMap<String, ProcessHandle>>,
+    /// Runtime usado para iniciar processos (Fase 3A: apenas local shell).
+    pub adapter: LocalShellAdapter,
+}
+
+impl Clone for ProcessManager {
+    fn clone(&self) -> Self {
+        Self {
+            processes: Mutex::new(HashMap::new()),
+            adapter: LocalShellAdapter,
+        }
+    }
+}
+
+impl ProcessManager {
+    pub fn new() -> Self {
+        Self {
+            processes: Mutex::new(HashMap::new()),
+            adapter: LocalShellAdapter,
+        }
+    }
+
+    /// Verifica se um agente já possui processo ativo.
+    pub fn is_running(&self, agent_id: &str) -> bool {
+        self.processes
+            .lock()
+            .expect("processes mutex poisoned")
+            .contains_key(agent_id)
+    }
+
+    /// Inicia o processo de um agente e emite eventos de saída/saída.
+    pub fn start(&self, app: &AppHandle, agent: &Agent) -> Result<(), RuntimeError> {
+        let agent_id = agent.id.clone();
+
+        // Evita duplicação: se já existe, retorna erro.
+        {
+            let guard = self.processes.lock().expect("processes mutex poisoned");
+            if guard.contains_key(&agent_id) {
+                return Err(RuntimeError("agente já está em execução".to_string()));
+            }
+        }
+
+        let app_started = app.clone();
+        let app_output = app.clone();
+        let app_exit = app.clone();
+        let app_error = app.clone();
+        let id_started = agent_id.clone();
+        let id_output = agent_id.clone();
+        let id_exit = agent_id.clone();
+        let id_error = agent_id.clone();
+
+        let handle = self.adapter.start(
+            agent,
+            move |text| {
+                let _ = app_output.emit(
+                    EVENT_AGENT_OUTPUT,
+                    AgentEvent {
+                        agent_id: id_output.clone(),
+                        data: text,
+                    },
+                );
+            },
+            move |status| {
+                let _ = app_exit.emit(
+                    EVENT_AGENT_STOPPED,
+                    AgentEvent {
+                        agent_id: id_exit.clone(),
+                        data: status.to_string(),
+                    },
+                );
+            },
+        )?;
+
+        // Registra o handle.
+        {
+            let mut guard = self.processes.lock().expect("processes mutex poisoned");
+            guard.insert(agent_id.clone(), handle);
+        }
+
+        let _ = app_started.emit(
+            EVENT_AGENT_STARTED,
+            AgentEvent {
+                agent_id: id_started,
+                data: String::new(),
+            },
+        );
+
+        let _ = app_error.emit(
+            EVENT_AGENT_STATUS_CHANGED,
+            AgentEvent {
+                agent_id: id_error,
+                data: Status::Running.as_str().to_string(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Envia input ao processo de um agente.
+    pub fn send_input(&self, agent_id: &str, input: &str) -> Result<(), RuntimeError> {
+        let mut guard = self.processes.lock().expect("processes mutex poisoned");
+        let handle = guard
+            .get_mut(agent_id)
+            .ok_or_else(|| RuntimeError("agente não está em execução".to_string()))?;
+        handle.write_input(input.as_bytes())
+    }
+
+    /// Redimensiona o PTY de um agente.
+    pub fn resize(&self, agent_id: &str, cols: u16, rows: u16) -> Result<(), RuntimeError> {
+        let mut guard = self.processes.lock().expect("processes mutex poisoned");
+        let handle = guard
+            .get_mut(agent_id)
+            .ok_or_else(|| RuntimeError("agente não está em execução".to_string()))?;
+        handle.resize(cols, rows)
+    }
+
+    /// Para o processo de um agente (SIGKILL) e remove do mapa.
+    pub fn stop(&self, app: &AppHandle, agent_id: &str) -> Result<(), RuntimeError> {
+        eprintln!("[PROCESS_MGR] stop begin agent_id={}", agent_id);
+        let mut handle = {
+            let mut guard = self.processes.lock().expect("processes mutex poisoned");
+            guard
+                .remove(agent_id)
+                .ok_or_else(|| RuntimeError("agente não está em execução".to_string()))?
+        };
+        eprintln!("[PROCESS_MGR] stop: handle removed from map, calling kill()...");
+
+        handle.kill()?;
+        eprintln!("[PROCESS_MGR] stop: kill() returned");
+
+        let _ = app.emit(
+            EVENT_AGENT_STOPPED,
+            AgentEvent {
+                agent_id: agent_id.to_string(),
+                data: "stopped".to_string(),
+            },
+        );
+        eprintln!("[PROCESS_MGR] stop complete");
+        Ok(())
+    }
+
+    /// Para todos os processos (usado no encerramento do app).
+    pub fn stop_all(&self) {
+        let mut guard = self.processes.lock().expect("processes mutex poisoned");
+        for (_, handle) in guard.iter_mut() {
+            let _ = handle.kill();
+        }
+        guard.clear();
+    }
+}
+
+impl Default for ProcessManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
