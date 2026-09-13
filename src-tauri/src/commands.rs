@@ -588,6 +588,13 @@ pub fn send_agent_input(
     id: String,
     input: String,
 ) -> Result<(), String> {
+    // Intercepta intenção de conexão nativa (ex.: "conecta Kilo 1 ao OpenCode 1")
+    // antes de enviar ao CLI. Se for intenção de conexão, resolve nativamente
+    // via bridge IPC da Fase 4 e não encaminha ao shell.
+    if let Some(_) = state.handle_connection_intent(&id, &input)? {
+        return Ok(());
+    }
+
     let workspace_id = {
         let guard = state
             .workspace

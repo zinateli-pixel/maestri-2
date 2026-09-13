@@ -3600,6 +3600,7 @@ name = "tauri-app"
 version = "0.1.0"
 dependencies = [
  "portable-pty",
+ "regex",
  "serde",
  "serde_json",
  "tauri",

@@ -475,6 +475,122 @@ impl AppState {
         }
     }
 
+    /// Tenta interpretar e executar uma intenção de conexão nativa a partir
+    /// da entrada do usuário (ex.: "conecta Kilo 1 ao OpenCode 1").
+    /// Retorna `Some(())` se a intenção foi reconhecida e tratada nativamente
+    /// (não deve ser encaminhada ao CLI), ou `None` se não for uma intenção
+    /// de conexão reconhecida (deve seguir fluxo normal para o CLI).
+    pub fn handle_connection_intent(
+        &self,
+        source_agent_id: &str,
+        input: &str,
+    ) -> Result<Option<()>, String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        // Padrões de intenção de conexão, compilados uma única vez (evita
+        // recompilar regex a cada tecla digitada no terminal).
+        static PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
+            std::sync::LazyLock::new(|| {
+                [
+                    // pt-BR
+                    r"(?i)^conecta\s+(.+?)\s+(?:ao|a|com)\s+(.+)$",
+                    r"(?i)^conectar\s+(.+?)\s+(?:ao|a|com)\s+(.+)$",
+                    r"(?i)^ligar\s+(.+?)\s+(?:a|com)\s+(.+)$",
+                    // en-US
+                    r"(?i)^connect\s+(.+?)\s+(?:to|with)\s+(.+)$",
+                    r"(?i)^link\s+(.+?)\s+(?:to|with)\s+(.+)$",
+                ]
+                .iter()
+                .filter_map(|pat| regex::Regex::new(pat).ok())
+                .collect()
+            });
+
+        let (source_name, target_name) = match PATTERNS
+            .iter()
+            .find_map(|re| re.captures(trimmed))
+        {
+            Some(caps) => {
+                let src = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+                let tgt = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+                if src.is_empty() || tgt.is_empty() {
+                    return Ok(None);
+                }
+                (src.to_string(), tgt.to_string())
+            }
+            None => return Ok(None),
+        };
+
+        // Resolve nomes para IDs dos agentes no workspace atual
+        let (agents, edges) = {
+            let guard = self.workspace.lock().expect("workspace mutex poisoned");
+            (guard.agents.clone(), guard.edges.clone())
+        };
+
+        let source_agent = agents.iter().find(|a| a.id == source_agent_id);
+        let Some(source_agent) = source_agent else {
+            return Ok(None);
+        };
+
+        // Resolve source_agent_id -> nome normalizado para comparação
+        let source_name_normalized = source_agent.name.trim().to_lowercase();
+        let source_name_input = source_name.trim().to_lowercase();
+
+        // O usuário pode referenciar o agente origem pelo nome ou "eu"/"me"/"this"
+        let is_self_ref = source_name_input == "eu"
+            || source_name_input == "me"
+            || source_name_input == "this"
+            || source_name_input == source_name_normalized;
+
+        if !is_self_ref && source_name_input != source_name_normalized {
+            // O usuário referenciou outro agente como origem - não interceptamos
+            // (pode ser um comando para outro agente)
+            return Ok(None);
+        }
+
+        // Resolve target pelo nome
+        let target_agent = agents.iter().find(|a| {
+            a.name.trim().to_lowercase() == target_name.trim().to_lowercase()
+        });
+        let Some(target_agent) = target_agent else {
+            // Agente alvo não encontrado - não intercepta, deixa ir para o CLI
+            return Ok(None);
+        };
+
+        // Verifica se já existe edge entre source e target
+        let edge_exists = edges.iter().any(|e| {
+            (e.source == source_agent.id && e.target == target_agent.id)
+                || (e.source == target_agent.id && e.target == source_agent.id)
+        });
+
+        // Se não existe edge, cria
+        if !edge_exists {
+            let edge = crate::models::Edge {
+                id: format!("edge-{}", crate::agent_bus::now_ms()),
+                source: source_agent.id.clone(),
+                target: target_agent.id.clone(),
+                source_handle: None,
+                target_handle: None,
+                edge_type: crate::models::EdgeType::Message,
+                label: None,
+            };
+            {
+                let mut guard = self.workspace.lock().expect("workspace mutex poisoned");
+                guard.edges.push(edge);
+            }
+            self.persist().map_err(|e| format!("falha ao persistir edge: {e}"))?;
+        }
+
+        // Handshake nativo: anuncia peers para ambos os agentes (se suportam protocolo)
+        // Isso injeta o contexto de peers via bridge IPC da Fase 4
+        self.announce_peers_to(&source_agent.id);
+        self.announce_peers_to(&target_agent.id);
+
+        Ok(Some(()))
+    }
+
     /// Verifica se uma mensagem (por id) já foi entregue nesta sessão
     /// (Agent Protocol: bloqueio de duplicação).
     pub fn was_delivered(&self, id: &str) -> bool {
@@ -572,6 +688,135 @@ impl AppState {
         for e in execs.into_iter().take(to_remove) {
             guard.remove(&e.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Agent, AgentKind, Role, Runtime, Status};
+
+    fn cli_agent(id: &str, name: &str, runtime: Runtime) -> Agent {
+        Agent {
+            id: id.to_string(),
+            name: name.to_string(),
+            role: Role::Orchestrator,
+            runtime,
+            kind: AgentKind::Cli,
+            model: String::new(),
+            command: "sh".to_string(),
+            args: vec![],
+            working_dir: String::new(),
+            auto_start: false,
+            status: Status::Idle,
+            x: 0.0,
+            y: 0.0,
+            width: None,
+            height: None,
+            collapsed: false,
+            locked: false,
+            accent: None,
+        }
+    }
+
+    fn test_state() -> AppState {
+        // Diretório único por instância para que testes paralelos não
+        // compartilhem o mesmo arquivo de workspace (evita corrida no JSON).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "maestro2-test-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let state = AppState::new(dir);
+        {
+            let mut guard = state.workspace.lock().expect("workspace mutex poisoned");
+            guard.agents = vec![
+                cli_agent("agent-1", "Kilo 1", Runtime::Kilo),
+                cli_agent("agent-2", "OpenCode 1", Runtime::OpenCode),
+            ];
+        }
+        state
+    }
+
+    #[test]
+    fn connection_intent_creates_edge_and_returns_handled() {
+        let state = test_state();
+
+        // "conecta Kilo 1 ao OpenCode 1" partindo do próprio Kilo 1
+        let result = state
+            .handle_connection_intent("agent-1", "conecta Kilo 1 ao OpenCode 1")
+            .expect("no error");
+        assert_eq!(result, Some(()));
+
+        let guard = state.workspace.lock().expect("workspace mutex poisoned");
+        assert_eq!(guard.edges.len(), 1);
+        assert_eq!(guard.edges[0].source, "agent-1");
+        assert_eq!(guard.edges[0].target, "agent-2");
+    }
+
+    #[test]
+    fn connection_intent_accepts_self_reference() {
+        let state = test_state();
+        let result = state
+            .handle_connection_intent("agent-1", "conecta eu ao OpenCode 1")
+            .expect("no error");
+        assert_eq!(result, Some(()));
+
+        let guard = state.workspace.lock().expect("workspace mutex poisoned");
+        assert_eq!(guard.edges.len(), 1);
+        assert_eq!(guard.edges[0].source, "agent-1");
+        assert_eq!(guard.edges[0].target, "agent-2");
+    }
+
+    #[test]
+    fn connection_intent_does_not_duplicate_edge() {
+        let state = test_state();
+        let _ = state.handle_connection_intent("agent-1", "conecta Kilo 1 ao OpenCode 1");
+        let _ = state.handle_connection_intent("agent-1", "conecta Kilo 1 ao OpenCode 1");
+
+        let guard = state.workspace.lock().expect("workspace mutex poisoned");
+        assert_eq!(guard.edges.len(), 1);
+    }
+
+    #[test]
+    fn non_connection_input_is_not_handled() {
+        let state = test_state();
+        // Entrada normal (não-intenção de conexão) não deve ser interceptada.
+        let result = state
+            .handle_connection_intent("agent-1", "escreva um teste")
+            .expect("no error");
+        assert_eq!(result, None);
+
+        let guard = state.workspace.lock().expect("workspace mutex poisoned");
+        assert!(guard.edges.is_empty());
+    }
+
+    #[test]
+    fn connection_intent_unknown_target_is_not_handled() {
+        let state = test_state();
+        let result = state
+            .handle_connection_intent("agent-1", "conecta Kilo 1 ao Agent Fantasma")
+            .expect("no error");
+        assert_eq!(result, None);
+
+        let guard = state.workspace.lock().expect("workspace mutex poisoned");
+        assert!(guard.edges.is_empty());
+    }
+
+    #[test]
+    fn connection_intent_english_variant() {
+        let state = test_state();
+        let result = state
+            .handle_connection_intent("agent-1", "connect Kilo 1 to OpenCode 1")
+            .expect("no error");
+        assert_eq!(result, Some(()));
+
+        let guard = state.workspace.lock().expect("workspace mutex poisoned");
+        assert_eq!(guard.edges.len(), 1);
+        assert_eq!(guard.edges[0].source, "agent-1");
+        assert_eq!(guard.edges[0].target, "agent-2");
     }
 }
 
