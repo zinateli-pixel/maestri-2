@@ -303,12 +303,13 @@ impl NodeExecutor for ProcessNodeExecutor {
     fn start(&self, app: Option<&AppHandle>, agent: &Agent) -> Result<Box<dyn ExitWatcher>, RuntimeError> {
         let app = app.expect("AppHandle necessário para ProcessNodeExecutor");
 
-        // Agentes web não executam via PTY; a execução em workflow exigirá o
-        // controle de navegador da Fase 16. Falha clara em vez de spawn errado.
-        if agent.kind == AgentKind::Web {
+        // Agentes não-CLI (Web/App) não executam via PTY; a execução em workflow
+        // exigirá o controle de navegador/app da Fase 16. Falha clara.
+        if agent.kind != AgentKind::Cli {
             return Err(RuntimeError(format!(
-                "agente '{}' é do tipo Web — execução em workflow disponível na Fase 16",
-                agent.name
+                "agente '{}' é do tipo {} — execução em workflow disponível na Fase 16",
+                agent.name,
+                agent.kind.as_str()
             )));
         }
 

@@ -325,9 +325,9 @@ pub fn restart_agent(
             .ok_or_else(|| "agente não encontrado".to_string())?
     };
 
-    // Agentes web reiniciam via sessão web (sem PTY).
-    if agent.kind == AgentKind::Web {
-        let _ = state.web_sessions.stop(&id);
+    // Agentes não-CLI (Web/App) reiniciam via sessão (sem PTY).
+    if agent.kind != AgentKind::Cli {
+        let _ = state.stop_non_cli_session(&agent);
         let workspace_id = {
             let guard = state
                 .workspace
@@ -336,7 +336,7 @@ pub fn restart_agent(
             guard.metadata.id.clone()
         };
         set_status(&state, &id, Status::Starting)?;
-        return match state.web_sessions.start(&agent, &workspace_id) {
+        return match state.start_non_cli_session(&agent, &workspace_id) {
             Ok(_) => {
                 set_status(&state, &id, Status::Running)?;
                 Ok(())
@@ -389,9 +389,9 @@ pub fn refresh_agent(
     };
     eprintln!("[REFRESH] agent found: {} command={}", agent.name, agent.command);
 
-    // Agentes web atualizam via sessão web (stop + start), sem PTY.
-    if agent.kind == AgentKind::Web {
-        let _ = state.web_sessions.stop(&id);
+    // Agentes não-CLI (Web/App) atualizam via sessão (stop + start), sem PTY.
+    if agent.kind != AgentKind::Cli {
+        let _ = state.stop_non_cli_session(&agent);
         let workspace_id = {
             let guard = state
                 .workspace
@@ -400,7 +400,7 @@ pub fn refresh_agent(
             guard.metadata.id.clone()
         };
         set_status(&state, &id, Status::Starting)?;
-        return match state.web_sessions.start(&agent, &workspace_id) {
+        return match state.start_non_cli_session(&agent, &workspace_id) {
             Ok(_) => {
                 set_status(&state, &id, Status::Running)?;
                 Ok(())
@@ -597,8 +597,8 @@ pub fn start_agent(
             .ok_or_else(|| "agente não encontrado".to_string())?
     };
 
-    // Agentes web têm ciclo de vida próprio (sem PTY/comando de CLI).
-    if agent.kind == AgentKind::Web {
+    // Agentes não-CLI (Web/App) têm ciclo de vida próprio (sem PTY/comando de CLI).
+    if agent.kind != AgentKind::Cli {
         set_status(&state, &id, Status::Starting)?;
         let workspace_id = {
             let guard = state
@@ -607,7 +607,7 @@ pub fn start_agent(
                 .expect("workspace mutex poisoned");
             guard.metadata.id.clone()
         };
-        return match state.web_sessions.start(&agent, &workspace_id) {
+        return match state.start_non_cli_session(&agent, &workspace_id) {
             Ok(_) => {
                 set_status(&state, &id, Status::Running)?;
                 Ok(())
@@ -648,7 +648,7 @@ pub fn stop_agent(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    let is_web = {
+    let is_non_cli = {
         let guard = state
             .workspace
             .lock()
@@ -657,12 +657,19 @@ pub fn stop_agent(
             .agents
             .iter()
             .find(|a| a.id == id)
-            .map(|a| a.kind == AgentKind::Web)
+            .map(|a| a.kind != AgentKind::Cli)
             .unwrap_or(false)
     };
 
-    if is_web {
-        state.web_sessions.stop(&id).map_err(|e| e.to_string())?;
+    if is_non_cli {
+        let agent = {
+            let guard = state
+                .workspace
+                .lock()
+                .expect("workspace mutex poisoned");
+            guard.agents.iter().find(|a| a.id == id).cloned().ok_or_else(|| "agente não encontrado".to_string())?
+        };
+        state.stop_non_cli_session(&agent).map_err(|e| e.to_string())?;
         set_status(&state, &id, Status::Stopped)?;
         return Ok(());
     }
@@ -689,25 +696,24 @@ pub fn send_agent_input(
         return Ok(());
     }
 
-    let (workspace_id, is_web) = {
+    let (workspace_id, kind) = {
         let guard = state
             .workspace
             .lock()
             .expect("workspace mutex poisoned");
-        let is_web = guard
+        let kind = guard
             .agents
             .iter()
             .find(|a| a.id == id)
-            .map(|a| a.kind == AgentKind::Web)
-            .unwrap_or(false);
-        (guard.metadata.id.clone(), is_web)
+            .map(|a| a.kind)
+            .unwrap_or(AgentKind::Cli);
+        (guard.metadata.id.clone(), kind)
     };
 
-    // Agentes web recebem entrada na sessão web (sem PTY).
-    if is_web {
+    // Agentes não-CLI (Web/App) recebem entrada na sessão própria (sem PTY).
+    if kind != AgentKind::Cli {
         return state
-            .web_sessions
-            .send_input(&id, &input)
+            .send_input_non_cli(&id, kind, &input)
             .map_err(|e| e.to_string());
     }
 

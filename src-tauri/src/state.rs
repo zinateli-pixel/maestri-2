@@ -76,6 +76,9 @@ pub struct AppState {
     /// Sessões web ativas (Fase 14 — AgentKind::Web), isoladas por workspace.
     pub web_sessions: crate::web_agent::WebSessionManager,
 
+    /// Sessões de aplicativo ativas (Fase 15 — AgentKind::App), isoladas por workspace.
+    pub app_sessions: crate::app_agent::AppSessionManager,
+
     /// Barramento interno de comunicação entre agentes.
     pub agent_bus: AgentBusState,
 
@@ -142,6 +145,7 @@ impl AppState {
             persistence,
             processes: ProcessManager::new(),
             web_sessions: crate::web_agent::WebSessionManager::new(),
+            app_sessions: crate::app_agent::AppSessionManager::new(),
             agent_bus: AgentBusState::new(),
             delivered_ids: Mutex::new(HashSet::new()),
             protocol_ready: Mutex::new(HashSet::new()),
@@ -199,6 +203,7 @@ impl AppState {
     pub fn stop_all_processes(&self) {
         self.processes.stop_all();
         self.web_sessions.stop_all();
+        self.app_sessions.stop_all();
         let mut changed = false;
         {
             let mut guard = self.workspace.lock().expect("workspace mutex poisoned");
@@ -214,6 +219,39 @@ impl AppState {
         }
         if changed {
             let _ = self.persist();
+        }
+    }
+
+    /// Inicia a sessão de um agente não-CLI (Web ou App) no workspace atual.
+    /// Agentes CLI não usam sessão e retornam erro (não devem chegar aqui).
+    pub fn start_non_cli_session(&self, agent: &Agent, workspace_id: &str) -> Result<(), String> {
+        match agent.kind {
+            AgentKind::Web => self.web_sessions.start(agent, workspace_id).map(|_| ()),
+            AgentKind::App => self.app_sessions.start(agent, workspace_id).map(|_| ()),
+            AgentKind::Cli => Err("agente CLI não usa sessão de execução".to_string()),
+        }
+    }
+
+    /// Encerra a sessão de um agente não-CLI (Web ou App).
+    pub fn stop_non_cli_session(&self, agent: &Agent) -> Result<(), String> {
+        match agent.kind {
+            AgentKind::Web => self.web_sessions.stop(&agent.id),
+            AgentKind::App => self.app_sessions.stop(&agent.id),
+            AgentKind::Cli => Err("agente CLI não usa sessão de execução".to_string()),
+        }
+    }
+
+    /// Envia entrada à sessão de um agente não-CLI (Web ou App).
+    pub fn send_input_non_cli(
+        &self,
+        agent_id: &str,
+        kind: AgentKind,
+        input: &str,
+    ) -> Result<(), String> {
+        match kind {
+            AgentKind::Web => self.web_sessions.send_input(agent_id, input),
+            AgentKind::App => self.app_sessions.send_input(agent_id, input),
+            AgentKind::Cli => Ok(()),
         }
     }
 

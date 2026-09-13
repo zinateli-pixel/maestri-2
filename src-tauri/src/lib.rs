@@ -1,5 +1,6 @@
 mod agent_bus;
 pub mod agent_bridge;
+mod app_agent;
 mod chain;
 mod commands;
 mod context_router;
@@ -127,6 +128,7 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 state.processes.stop_all();
                 state.web_sessions.stop_all();
+                state.app_sessions.stop_all();
             }
         });
 }
