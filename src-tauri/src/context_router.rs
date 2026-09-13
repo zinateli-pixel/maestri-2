@@ -23,12 +23,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 
-/// Tipo de mensagem de contexto. Hoje apenas `Context`; extensível a
-/// TASK/MESSAGE/RESULT nas próximas fases.
+/// Tipo de mensagem roteada. `Context` é mensagem unidirecional; `Request`
+/// (ask) aguarda uma `Reply` correlacionada pela identidade da request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
     Context,
+    /// Pedido (ask): solicita algo a um peer e aguarda resposta.
+    Request,
+    /// Resposta a uma `Request` (correlacionada via `correlation_id`).
+    Reply,
 }
 
 /// Mensagem interna roteada entre um agente origem e um destino.
@@ -57,6 +61,9 @@ pub struct RoutedMessage {
     /// Referência mínima opcional a uma memória (Fase 11). Sem RAG ainda.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_id: Option<String>,
+    /// Correlação de uma `Reply` com a `Request` original (id da request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 impl RoutedMessage {
@@ -78,7 +85,34 @@ impl RoutedMessage {
             timestamp,
             skill_id: None,
             memory_id: None,
+            correlation_id: None,
         }
+    }
+
+    /// Cria uma `Request` (ask) endereçada a um peer.
+    pub fn request(
+        workspace_id: &str,
+        source: &str,
+        target: &str,
+        payload: &str,
+        timestamp: u64,
+    ) -> Self {
+        Self::new(workspace_id, source, target, MessageKind::Request, payload, timestamp)
+    }
+
+    /// Cria uma `Reply` correlacionada à `Request` de id `correlation_id`.
+    pub fn reply(
+        workspace_id: &str,
+        source: &str,
+        target: &str,
+        payload: &str,
+        timestamp: u64,
+        correlation_id: &str,
+    ) -> Self {
+        let mut message =
+            Self::new(workspace_id, source, target, MessageKind::Reply, payload, timestamp);
+        message.correlation_id = Some(correlation_id.to_string());
+        message
     }
 
     /// Anexa a referência mínima a uma skill à mensagem.
@@ -93,10 +127,26 @@ impl RoutedMessage {
         self
     }
 
-    /// Envelope explícito injetado no stdin do destino. Deixa claro que é
-    /// contexto roteado (não digitação do usuário) e termina em newline.
+    /// Envelope explícito injetado no stdin do destino. Deixa claro a natureza
+    /// (context/request/reply), origem/destino e, quando aplicável, o id de
+    /// correlação — para o destinatário poder responder ou reconhecer a origem.
     pub fn envelope(&self) -> String {
-        format!("[context {} -> {}] {}\n", self.source, self.target, self.payload)
+        match self.kind {
+            MessageKind::Context => {
+                format!("[context {} -> {}] {}\r", self.source, self.target, self.payload)
+            }
+            MessageKind::Request => {
+                format!(
+                    "[MAESTRO 2.0 request id={} from={} to={}] {}\n\
+Reply using your shell tool: \"$MAESTRO2_CLI\" agent-bridge reply \"{}\" \"<your answer>\"\r",
+                    self.id, self.source, self.target, self.payload, self.id
+                )
+            }
+            MessageKind::Reply => {
+                let correlation = self.correlation_id.as_deref().unwrap_or("");
+                format!("[reply {} from {} -> {}] {}\r", correlation, self.source, self.target, self.payload)
+            }
+        }
     }
 }
 
@@ -106,6 +156,97 @@ pub struct DeliveryReport {
     pub target: String,
     pub delivered: bool,
     pub error: Option<String>,
+}
+
+/// Resultado de um pedido (ask) a um peer. `request_id` é a identidade de
+/// correlação que o destino usa para responder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskReport {
+    pub target: String,
+    pub delivered: bool,
+    pub request_id: String,
+    pub error: Option<String>,
+}
+
+/// Pedido (ask) pendente aguardando resposta de um peer.
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    pub request_id: String,
+    pub workspace_id: String,
+    /// Quem fez o pedido (destinatário da resposta).
+    pub source: String,
+    /// Quem deve responder.
+    pub target: String,
+    pub created_at: u64,
+}
+
+/// Registro de pedidos pendentes para correlação de respostas (request/reply).
+/// Thread-safe e independente do transporte (testável sem `AppHandle`).
+#[derive(Default)]
+pub struct RequestRegistry {
+    pending: std::sync::Mutex<std::collections::HashMap<String, PendingRequest>>,
+}
+
+impl RequestRegistry {
+    /// TTL (ms) de uma request antes de ser considerada expirada.
+    // CLIs interativos podem levar mais de um minuto para raciocinar, pedir
+    // aprovação de ferramenta e executar a resposta. Cinco minutos mantém a
+    // correlação útil sem deixar pedidos abandonados indefinidamente.
+    pub const TTL_MS: u64 = 5 * 60_000;
+
+    pub fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Registra um pedido pendente.
+    pub fn register(&self, request: PendingRequest) {
+        self.pending
+            .lock()
+            .expect("pending_requests mutex poisoned")
+            .insert(request.request_id.clone(), request);
+    }
+
+    /// Remove (consome) um pedido pendente pelo id de correlação.
+    pub fn take(&self, request_id: &str) -> Option<PendingRequest> {
+        self.pending
+            .lock()
+            .expect("pending_requests mutex poisoned")
+            .remove(request_id)
+    }
+
+    pub fn remove(&self, request_id: &str) {
+        let _ = self.take(request_id);
+    }
+
+    /// Consulta (sem remover) um pedido pendente pelo id de correlação.
+    pub fn peek(&self, request_id: &str) -> Option<PendingRequest> {
+        self.pending
+            .lock()
+            .expect("pending_requests mutex poisoned")
+            .get(request_id)
+            .cloned()
+    }
+
+    /// Remove pedidos expirados (timeout). Retorna quantos foram removidos.
+    pub fn prune_expired(&self, now: u64) -> usize {
+        let mut guard = self.pending.lock().expect("pending_requests mutex poisoned");
+        let before = guard.len();
+        guard.retain(|_, p| now.saturating_sub(p.created_at) <= Self::TTL_MS);
+        before - guard.len()
+    }
+
+    /// Retorna a quantidade de pedidos pendentes (para diagnóstico/testes).
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.pending.lock().expect("pending_requests mutex poisoned").len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Trait de transporte: entrega uma mensagem de contexto ao agente destino.
@@ -304,6 +445,167 @@ impl ContextRouter {
             error: result.err(),
         }
     }
+
+    /// Faz um pedido (ask) da origem a um peer conectado (nome ou id).
+    /// Registra a request ANTES da entrega para não perder uma resposta rápida;
+    /// se a entrega falhar, desfaz o registro.
+    pub fn ask_to_peer(
+        &self,
+        app: Option<&AppHandle>,
+        registry: &RequestRegistry,
+        workspace_id: &str,
+        agents: &[Agent],
+        edges: &[Edge],
+        source_id: &str,
+        target_ref: &str,
+        payload: &str,
+        now: u64,
+    ) -> AskReport {
+        if source_id == target_ref {
+            return AskReport {
+                target: target_ref.to_string(),
+                delivered: false,
+                request_id: String::new(),
+                error: Some("não é possível fazer um pedido para si mesmo".to_string()),
+            };
+        }
+
+        let Some(target_id) = resolve_peer_id(agents, edges, source_id, target_ref) else {
+            return AskReport {
+                target: target_ref.to_string(),
+                delivered: false,
+                request_id: String::new(),
+                error: Some("destino não conectado/encontrado".to_string()),
+            };
+        };
+        let Some(target) = agents.iter().find(|a| a.id == target_id) else {
+            return AskReport {
+                target: target_id,
+                delivered: false,
+                request_id: String::new(),
+                error: Some("destino inexistente".to_string()),
+            };
+        };
+
+        let message = RoutedMessage::request(workspace_id, source_id, &target_id, payload, now);
+
+        registry.register(PendingRequest {
+            request_id: message.id.clone(),
+            workspace_id: workspace_id.to_string(),
+            source: source_id.to_string(),
+            target: target_id.clone(),
+            created_at: now,
+        });
+
+        if let Err(err) = self.transport.deliver(app, target, &message) {
+            registry.remove(&message.id);
+            return AskReport {
+                target: target_id,
+                delivered: false,
+                request_id: message.id,
+                error: Some(err),
+            };
+        }
+
+        AskReport {
+            target: target_id,
+            delivered: true,
+            request_id: message.id,
+            error: None,
+        }
+    }
+
+    /// Entrega uma resposta (reply) correlacionada a uma request. Valida
+    /// workspace, emissor (somente o alvo responde) e timeout, encaminhando
+    /// a `Reply` de volta ao requisitante original. Transporte-agnóstico.
+    pub fn reply_to_request(
+        &self,
+        app: Option<&AppHandle>,
+        registry: &RequestRegistry,
+        workspace_id: &str,
+        agents: &[Agent],
+        source_id: &str,
+        correlation_id: &str,
+        payload: &str,
+        now: u64,
+    ) -> DeliveryReport {
+        // Valida ANTES de consumir: uma resposta inválida (workspace errado,
+        // emissor errado ou expirada) não deve consumir a request, para que o
+        // respondente legítimo ainda consiga responder.
+        let Some(pending) = registry.peek(correlation_id) else {
+            return DeliveryReport {
+                target: correlation_id.to_string(),
+                delivered: false,
+                error: Some("request de correlação não encontrada (inexistente ou já respondida)".to_string()),
+            };
+        };
+
+        // Isolamento por workspace.
+        if pending.workspace_id != workspace_id {
+            return DeliveryReport {
+                target: pending.source.clone(),
+                delivered: false,
+                error: Some("resposta pertence a outro workspace".to_string()),
+            };
+        }
+
+        // Somente o agente alvo da request pode responder.
+        if pending.target != source_id {
+            return DeliveryReport {
+                target: pending.source.clone(),
+                delivered: false,
+                error: Some("somente o agente alvo pode responder a esta request".to_string()),
+            };
+        }
+
+        // Timeout explícito: request expirada não é mais aceita.
+        if now.saturating_sub(pending.created_at) > RequestRegistry::TTL_MS {
+            return DeliveryReport {
+                target: pending.source.clone(),
+                delivered: false,
+                error: Some("request expirada (timeout)".to_string()),
+            };
+        }
+
+        let Some(requester) = agents.iter().find(|a| a.id == pending.source) else {
+            return DeliveryReport {
+                target: pending.source.clone(),
+                delivered: false,
+                error: Some("requisitante inexistente".to_string()),
+            };
+        };
+
+        // Reserva a request para garantir exatamente uma resposta concorrente.
+        // Se a entrega local falhar, recoloca a mesma correlação para permitir
+        // retry enquanto o TTL ainda estiver válido.
+        let Some(pending) = registry.take(correlation_id) else {
+            return DeliveryReport {
+                target: correlation_id.to_string(),
+                delivered: false,
+                error: Some("request de correlação não encontrada (inexistente ou já respondida)".to_string()),
+            };
+        };
+
+        let message =
+            RoutedMessage::reply(workspace_id, source_id, &pending.source, payload, now, correlation_id);
+
+        match self.transport.deliver(app, requester, &message) {
+            Ok(()) => DeliveryReport {
+                target: pending.source.clone(),
+                delivered: true,
+                error: None,
+            },
+            Err(e) => {
+                let target = pending.source.clone();
+                registry.register(pending);
+                DeliveryReport {
+                    target,
+                    delivered: false,
+                    error: Some(e),
+                }
+            }
+        }
+    }
 }
 
 /// Encaminha explicitamente um payload da origem para os destinos conectados.
@@ -330,6 +632,19 @@ pub fn route_context_to(
     Ok(state.route_context_to_peer(&app, &source_id, &target, &payload))
 }
 
+/// Faz um pedido (ask) da origem para um peer específico (nome ou id).
+/// A resposta chega de volta à origem de forma correlacionada (request_id).
+#[tauri::command]
+pub fn route_context_ask(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_id: String,
+    target: String,
+    payload: String,
+) -> Result<AskReport, String> {
+    Ok(state.ask_peer(&app, &source_id, &target, &payload))
+}
+
 // ---------------------------------------------------------------------------
 // Descoberta e protocolo de envio iniciado pelo agente (Fase 4).
 // Um agente CLI não tem acesso a filesystem/processos/internet, então o
@@ -341,6 +656,10 @@ pub fn route_context_to(
 pub const PROTOCOL_PREFIX: &str = "[[MESTRO:";
 /// Prefixo da diretiva de envio: `[[MESTRO:send <alvo>]] <payload>`.
 pub const SEND_PREFIX: &str = "[[MESTRO:send ";
+/// Prefixo da diretiva de pedido: `[[MESTRO:ask <alvo>]] <payload>`.
+pub const ASK_PREFIX: &str = "[[MESTRO:ask ";
+/// Prefixo da diretiva de resposta: `[[MESTRO:reply <request_id>]] <payload>`.
+pub const REPLY_PREFIX: &str = "[[MESTRO:reply ";
 /// Diretiva para (re)listar os peers conectados: `[[MESTRO:peers]]`.
 pub const PEERS_DIRECTIVE: &str = "[[MESTRO:peers]]";
 
@@ -349,6 +668,10 @@ pub const PEERS_DIRECTIVE: &str = "[[MESTRO:peers]]";
 pub enum ProtocolDirective {
     /// Enviar contexto/mensagem para um peer conectado.
     Send { target: String, payload: String },
+    /// Pedir algo a um peer conectado (aguarda resposta correlacionada).
+    Ask { target: String, payload: String },
+    /// Responder a uma request, correlacionada pelo `correlation_id`.
+    Reply { correlation_id: String, payload: String },
     /// Solicitar a lista de peers conectados.
     Peers,
 }
@@ -472,7 +795,24 @@ fn parse_protocol_line(line: &str) -> Option<ProtocolDirective> {
         return None;
     }
 
-    let rest = trimmed.strip_prefix(SEND_PREFIX)?;
+    if let Some((correlation_id, payload)) = parse_target_directive(trimmed, REPLY_PREFIX) {
+        return Some(ProtocolDirective::Reply { correlation_id, payload });
+    }
+
+    if let Some((target, payload)) = parse_target_directive(trimmed, ASK_PREFIX) {
+        return Some(ProtocolDirective::Ask { target, payload });
+    }
+
+    if let Some((target, payload)) = parse_target_directive(trimmed, SEND_PREFIX) {
+        return Some(ProtocolDirective::Send { target, payload });
+    }
+
+    None
+}
+
+/// Extrai `(<alvo|request_id>, <payload>)` de uma diretiva com prefixo `[[MESTRO:<prefixo> <X>]] <payload>`.
+fn parse_target_directive(trimmed: &str, prefix: &str) -> Option<(String, String)> {
+    let rest = trimmed.strip_prefix(prefix)?;
     let close = rest.find("]]")?;
     let target = rest[..close].trim();
     if target.is_empty() {
@@ -482,10 +822,7 @@ fn parse_protocol_line(line: &str) -> Option<ProtocolDirective> {
     if payload.is_empty() {
         return None;
     }
-    Some(ProtocolDirective::Send {
-        target: target.to_string(),
-        payload: payload.to_string(),
-    })
+    Some((target.to_string(), payload.to_string()))
 }
 
 /// Retorna os ids dos agentes conectados a `agent_id` por qualquer edge
@@ -538,8 +875,12 @@ const IDENTITY_HEADER: &str = "\
 /// diretiva nunca apareça no INÍCIO de uma linha (evita que o scanner
 /// interprete o eco do banner como uma diretiva real de send/list).
 const DIRECTIVE_HINTS: &str = "\
-[MESTRO] To re-list your connected peers, print the directive [[MESTRO:peers]] on its own line.\n\
-[MESTRO] To send a message to a connected peer, print the directive [[MESTRO:send <name_or_id>]] <your message> on its own line.\n";
+[MESTRO] REQUIRED HANDSHAKE: use your shell tool now to run: \"$MAESTRO2_CLI\" agent-bridge ready\n\
+[MESTRO] To list peers, run with your shell tool: \"$MAESTRO2_CLI\" agent-bridge peers\n\
+[MESTRO] To send one-way, run: \"$MAESTRO2_CLI\" agent-bridge send \"<name_or_id>\" \"<message>\"\n\
+[MESTRO] To ask and receive a correlated reply, run: \"$MAESTRO2_CLI\" agent-bridge ask \"<name_or_id>\" \"<question>\"\n\
+[MESTRO] For an incoming request, run the exact agent-bridge reply command included in its envelope.\n\
+[MESTRO] Legacy stdout directives [[MESTRO:peers]], [[MESTRO:send ...]], [[MESTRO:ask ...]], and [[MESTRO:reply ...]] remain supported as fallback only.\n";
 
 /// Constrói a mensagem de descoberta (banner/notícia de identidade) para o
 /// agente `source_id`. SEMPRE retorna conteúdo: identidade do MAESTRO 2.0 +
@@ -561,6 +902,13 @@ pub fn build_peers_banner(agents: &[Agent], edges: &[Edge], source_id: &str) -> 
     };
 
     format!("{}{}{}", IDENTITY_HEADER, DIRECTIVE_HINTS, peers_line)
+}
+
+/// Converte texto em uma submissão para TUI em PTY raw. Nesses runtimes,
+/// carriage return (`\r`) representa Enter; `\n` sozinho pode apenas deixar
+/// o texto no editor sem enviá-lo ao modelo.
+pub fn pty_submission(text: &str) -> String {
+    format!("{}\r", text.trim_end_matches(['\r', '\n']))
 }
 
 /// O Agent Protocol é uma conversa com um agente, não texto de inicialização
@@ -794,9 +1142,14 @@ mod tests {
     }
 
     #[test]
-    fn envelope_is_explicit_and_newline_terminated() {
+    fn envelope_is_explicit_and_enter_terminated() {
         let m = RoutedMessage::new("ws1", "a1", "a2", MessageKind::Context, "alô", 123);
-        assert_eq!(m.envelope(), "[context a1 -> a2] alô\n");
+        assert_eq!(m.envelope(), "[context a1 -> a2] alô\r");
+    }
+
+    #[test]
+    fn pty_submission_uses_carriage_return_as_enter() {
+        assert_eq!(pty_submission("line 1\nline 2\n"), "line 1\nline 2\r");
     }
 
     #[test]
@@ -1201,5 +1554,237 @@ mod tests {
         // Diretiva em meio a texto NÃO dispara (evita eco do banner).
         assert!(parse_protocol_line("[MESTRO] use [[MESTRO:send X]] y\n").is_none());
         assert!(parse_protocol_line("prefix [[MESTRO:peers]]\n").is_none());
+    }
+
+    #[test]
+    fn parse_protocol_line_ask_and_reply() {
+        match parse_protocol_line("[[MESTRO:ask Cline]] qual o status?\n").unwrap() {
+            ProtocolDirective::Ask { target, payload } => {
+                assert_eq!(target, "Cline");
+                assert_eq!(payload, "qual o status?");
+            }
+            _ => panic!("esperado Ask"),
+        }
+        match parse_protocol_line("[[MESTRO:reply msg-1]] ok\n").unwrap() {
+            ProtocolDirective::Reply { correlation_id, payload } => {
+                assert_eq!(correlation_id, "msg-1");
+                assert_eq!(payload, "ok");
+            }
+            _ => panic!("esperado Reply"),
+        }
+        assert!(parse_protocol_line("[[MESTRO:ask ]] x").is_none());
+        assert!(parse_protocol_line("[[MESTRO:reply ]] x").is_none());
+        assert!(parse_protocol_line("[[MESTRO:reply msg-1]] ").is_none());
+    }
+
+    #[test]
+    fn scanner_detects_ask_and_reply_split_across_chunks() {
+        let mut sc = ProtocolScanner::new();
+        let r1 = sc.feed("[[MESTRO:as");
+        assert!(r1.directives.is_empty());
+        let r2 = sc.feed("k Cline]] pergunta\n[[MESTRO:reply msg-9]] resposta\n");
+        assert_eq!(r2.directives.len(), 2);
+        assert_eq!(
+            r2.directives[0],
+            ProtocolDirective::Ask { target: "Cline".to_string(), payload: "pergunta".to_string() }
+        );
+        assert_eq!(
+            r2.directives[1],
+            ProtocolDirective::Reply { correlation_id: "msg-9".to_string(), payload: "resposta".to_string() }
+        );
+    }
+
+    #[test]
+    fn envelope_request_and_reply_include_correlation() {
+        let req = RoutedMessage::request("ws1", "a1", "a2", "oi", 100);
+        assert!(req.envelope().starts_with("[MAESTRO 2.0 request "));
+        assert!(req.envelope().contains(&req.id));
+        assert!(req.envelope().contains("oi"));
+        assert!(req.envelope().contains("agent-bridge reply"));
+
+        let rep = RoutedMessage::reply("ws1", "a2", "a1", "sim", 101, &req.id);
+        assert!(rep.envelope().starts_with("[reply "));
+        assert!(rep.envelope().contains(&req.id));
+        assert_eq!(rep.correlation_id.as_deref(), Some(req.id.as_str()));
+    }
+
+    #[test]
+    fn request_and_reply_serde_correlation() {
+        let req = RoutedMessage::request("ws1", "a1", "a2", "oi", 100);
+        let back: RoutedMessage = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back.kind, MessageKind::Request);
+        assert_eq!(back.correlation_id, None);
+
+        let rep = RoutedMessage::reply("ws1", "a2", "a1", "sim", 101, &req.id);
+        let back: RoutedMessage = serde_json::from_str(&serde_json::to_string(&rep).unwrap()).unwrap();
+        assert_eq!(back.kind, MessageKind::Reply);
+        assert_eq!(back.correlation_id.as_deref(), Some(req.id.as_str()));
+    }
+
+    #[test]
+    fn ask_then_reply_routes_a_to_b_to_a() {
+        let a = cli_agent_named("a1", "OpenCode");
+        let b = cli_agent_named("a2", "Cline");
+        let agents = vec![a, b];
+        let edges = vec![sample_edge("a1", "a2")];
+        let transport = Arc::new(MockTransport::new(&["a1", "a2"]));
+        let router = ContextRouter::new(transport.clone());
+        let registry = RequestRegistry::new();
+
+        let ask = router.ask_to_peer(None, &registry, "ws1", &agents, &edges, "a1", "Cline", "qual o status?", 1000);
+        assert!(ask.delivered, "ask deveria entregar: {:?}", ask.error);
+        assert_eq!(ask.target, "a2");
+        assert!(!ask.request_id.is_empty());
+        assert_eq!(registry.len(), 1);
+
+        let reply = router.reply_to_request(None, &registry, "ws1", &agents, "a2", &ask.request_id, "rodando ok", 2000);
+        assert!(reply.delivered, "reply deveria entregar: {:?}", reply.error);
+        assert_eq!(reply.target, "a1");
+        assert!(registry.is_empty(), "request deve ser consumida após resposta");
+
+        // Sequência prova o ciclo A -> B -> A no mesmo workspace.
+        assert_eq!(transport.delivered_targets(), vec!["a2".to_string(), "a1".to_string()]);
+    }
+
+    #[test]
+    fn failed_reply_delivery_keeps_request_for_retry() {
+        let a = cli_agent_named("a1", "OpenCode");
+        let b = cli_agent_named("a2", "Cline");
+        let agents = vec![a, b];
+        let edges = vec![sample_edge("a1", "a2")];
+        // O alvo recebe o ask, mas o requisitante deixa de estar RUNNING antes
+        // da resposta.
+        let transport = Arc::new(MockTransport::new(&["a2"]));
+        let router = ContextRouter::new(transport);
+        let registry = RequestRegistry::new();
+
+        let ask = router.ask_to_peer(None, &registry, "ws1", &agents, &edges, "a1", "Cline", "x", 1);
+        assert!(ask.delivered);
+
+        let reply = router.reply_to_request(None, &registry, "ws1", &agents, "a2", &ask.request_id, "y", 2);
+        assert!(!reply.delivered);
+        assert_eq!(registry.len(), 1, "falha transitória não deve perder a correlação");
+        assert!(registry.peek(&ask.request_id).is_some());
+    }
+
+    #[test]
+    fn ask_to_peer_blocks_self_and_non_connected() {
+        let a = cli_agent_named("a1", "OpenCode");
+        let b = cli_agent_named("a2", "Cline");
+        let agents = vec![a, b];
+        let edges = vec![sample_edge("a1", "a2")];
+        let transport = Arc::new(MockTransport::new(&["a2"]));
+        let router = ContextRouter::new(transport);
+        let registry = RequestRegistry::new();
+
+        let self_ask = router.ask_to_peer(None, &registry, "ws1", &agents, &edges, "a1", "a1", "x", 1);
+        assert!(!self_ask.delivered);
+        assert!(self_ask.error.as_deref().unwrap().contains("si mesmo"));
+
+        let ghost = router.ask_to_peer(None, &registry, "ws1", &agents, &edges, "a1", "ghost", "x", 1);
+        assert!(!ghost.delivered);
+        assert!(ghost.error.as_deref().unwrap().contains("não conectado"));
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn reply_rejects_wrong_workspace_without_consuming() {
+        let a = cli_agent_named("a1", "OpenCode");
+        let b = cli_agent_named("a2", "Cline");
+        let agents = vec![a, b];
+        let edges = vec![sample_edge("a1", "a2")];
+        let transport = Arc::new(MockTransport::new(&["a2", "a1"]));
+        let router = ContextRouter::new(transport);
+        let registry = RequestRegistry::new();
+
+        let ask = router.ask_to_peer(None, &registry, "ws-A", &agents, &edges, "a1", "Cline", "x", 1);
+        assert!(ask.delivered);
+
+        // Resposta de outro workspace: recusada E request mantida.
+        let reply = router.reply_to_request(None, &registry, "ws-B", &agents, "a2", &ask.request_id, "y", 2);
+        assert!(!reply.delivered);
+        assert!(reply.error.as_deref().unwrap().contains("workspace"));
+        assert_eq!(registry.len(), 1, "recusa não deve consumir a request");
+
+        // O respondente correto, no workspace certo, ainda consegue responder.
+        let ok = router.reply_to_request(None, &registry, "ws-A", &agents, "a2", &ask.request_id, "y", 3);
+        assert!(ok.delivered);
+        assert_eq!(ok.target, "a1");
+    }
+
+    #[test]
+    fn reply_rejects_non_target_responder() {
+        let a = cli_agent_named("a1", "OpenCode");
+        let b = cli_agent_named("a2", "Cline");
+        let c = cli_agent_named("a3", "Kilo");
+        let agents = vec![a, b, c];
+        let edges = vec![sample_edge("a1", "a2")];
+        let transport = Arc::new(MockTransport::new(&["a2", "a3", "a1"]));
+        let router = ContextRouter::new(transport);
+        let registry = RequestRegistry::new();
+
+        let ask = router.ask_to_peer(None, &registry, "ws1", &agents, &edges, "a1", "Cline", "x", 1);
+        assert!(ask.delivered);
+
+        // Um terceiro agente não pode responder no lugar do alvo.
+        let reply = router.reply_to_request(None, &registry, "ws1", &agents, "a3", &ask.request_id, "roubada", 2);
+        assert!(!reply.delivered);
+        assert!(reply.error.as_deref().unwrap().contains("alvo"));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn reply_after_timeout_is_rejected() {
+        let a = cli_agent_named("a1", "OpenCode");
+        let b = cli_agent_named("a2", "Cline");
+        let agents = vec![a, b];
+        let edges = vec![sample_edge("a1", "a2")];
+        let transport = Arc::new(MockTransport::new(&["a2", "a1"]));
+        let router = ContextRouter::new(transport);
+        let registry = RequestRegistry::new();
+
+        let ask = router.ask_to_peer(None, &registry, "ws1", &agents, &edges, "a1", "Cline", "x", 1);
+        assert!(ask.delivered);
+
+        // Após o TTL, a resposta é recusada explicitamente.
+        let late = router.reply_to_request(
+            None,
+            &registry,
+            "ws1",
+            &agents,
+            "a2",
+            &ask.request_id,
+            "tarde",
+            RequestRegistry::TTL_MS + 2,
+        );
+        assert!(!late.delivered);
+        assert!(late.error.as_deref().unwrap().contains("timeout"));
+    }
+
+    #[test]
+    fn registry_prune_expired_removes_only_expired() {
+        let registry = RequestRegistry::new();
+        registry.register(PendingRequest {
+            request_id: "fresh".to_string(),
+            workspace_id: "ws1".to_string(),
+            source: "a1".to_string(),
+            target: "a2".to_string(),
+            created_at: 50_000,
+        });
+        registry.register(PendingRequest {
+            request_id: "old".to_string(),
+            workspace_id: "ws1".to_string(),
+            source: "a1".to_string(),
+            target: "a2".to_string(),
+            created_at: 0,
+        });
+
+        let now = RequestRegistry::TTL_MS + 1;
+        // `old` passou do TTL; `fresh` ainda tem somente TTL - 49_999 ms.
+        let removed = registry.prune_expired(now);
+        assert_eq!(removed, 1);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.peek("fresh").is_some());
+        assert!(registry.peek("old").is_none());
     }
 }

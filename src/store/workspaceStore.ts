@@ -5,6 +5,7 @@ import { routeOutput } from "../terminal/terminalRegistry";
 import type {
   Agent,
   CreateAgentInput,
+  AskReport,
   DeliveryReport,
   Edge,
   UpdateAgentInput,
@@ -111,6 +112,12 @@ interface WorkspaceStore {
   resizeAgent: (id: string, cols: number, rows: number) => Promise<void>;
   /** Envia contexto de um agente para os destinos conectados (Fase 4). */
   routeContext: (sourceId: string, payload: string) => Promise<DeliveryReport[]>;
+  /** Faz um pedido (ask) de um agente para um peer (request/reply, Fase 4). */
+  routeContextAsk: (
+    sourceId: string,
+    target: string,
+    payload: string
+  ) => Promise<AskReport>;
   setAgentStatus: (id: string, status: Agent["status"]) => void;
 
   // Workspace management
@@ -639,6 +646,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
         get().pushToast(msg, failed === 0 ? "success" : "error");
       }
       return reports;
+    },
+
+    routeContextAsk: async (sourceId, target, payload) => {
+      const report = await invoke<AskReport>("route_context_ask", {
+        sourceId,
+        target,
+        payload,
+      });
+      if (report.delivered) {
+        get().pushToast(`Pedido enviado para "${report.target}"`, "success");
+      } else {
+        get().pushToast(`Pedido falhou: ${report.error ?? "erro"}`, "error");
+      }
+      return report;
     },
 
     setAgentStatus: (id, status) => {

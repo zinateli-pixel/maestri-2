@@ -1,5 +1,5 @@
 use crate::models::{Agent, AgentKind, Edge, EdgeType, Role, Runtime, Status, Viewport, WorkspaceListItem, WorkspaceSettings, WorkspaceState};
-use crate::context_router::{build_peers_banner, supports_agent_protocol, CliContextTransport, ContextRouter, DeliveryReport};
+use crate::context_router::{build_peers_banner, pty_submission, supports_agent_protocol, AskReport, CliContextTransport, ContextRouter, DeliveryReport, RequestRegistry};
 use crate::events::{WorkflowEvent, WorkflowEventLog};
 use crate::persistence::Persistence;
 use crate::process_manager::ProcessManager;
@@ -79,6 +79,13 @@ pub struct AppState {
     /// Ids de mensagens já entregues (bloqueio de duplicação do Agent Protocol).
     pub delivered_ids: Mutex<HashSet<String>>,
 
+    /// Handshakes confirmados pelo canal IPC (`workspace_id\0agent_id`).
+    /// Controla o retry de discovery sem continuar injetando prompts no TUI.
+    pub protocol_ready: Mutex<HashSet<String>>,
+
+    /// Pedidos (ask) pendentes aguardando resposta (correlação request/reply).
+    pub pending_requests: RequestRegistry,
+
     /// Log de eventos de workflow observáveis (Fase 7), escopado por workspace.
     pub workflow_events: WorkflowEventLog,
 }
@@ -133,6 +140,8 @@ impl AppState {
             processes: ProcessManager::new(),
             agent_bus: AgentBusState::new(),
             delivered_ids: Mutex::new(HashSet::new()),
+            protocol_ready: Mutex::new(HashSet::new()),
+            pending_requests: RequestRegistry::new(),
             workflow_events,
         }
     }
@@ -294,6 +303,152 @@ impl AppState {
         report
     }
 
+    /// Faz um pedido (ask) de `source_id` a um peer (nome ou id), restrito à
+    /// topologia das edges e ao workspace atual. A request fica pendente para
+    /// correlação da resposta (request/reply) com timeout.
+    pub fn ask_peer(
+        &self,
+        app: &tauri::AppHandle,
+        source_id: &str,
+        target_ref: &str,
+        payload: &str,
+    ) -> AskReport {
+        let (workspace_id, agents, edges) = {
+            let guard = self.workspace.lock().expect("workspace mutex poisoned");
+            (
+                guard.metadata.id.clone(),
+                guard.agents.clone(),
+                guard.edges.clone(),
+            )
+        };
+        let now = crate::agent_bus::now_ms();
+        // Higieniza pedidos expirados antes de registrar um novo (sem vazamento).
+        self.pending_requests.prune_expired(now);
+        let transport = Arc::new(CliContextTransport);
+        let router = ContextRouter::new(transport);
+        let report = router.ask_to_peer(
+            Some(app),
+            &self.pending_requests,
+            &workspace_id,
+            &agents,
+            &edges,
+            source_id,
+            target_ref,
+            payload,
+            now,
+        );
+
+        // Registra o pedido no barramento interno (out = origem, in = destino).
+        self.agent_bus.push(AgentBusMessage {
+            workspace_id: workspace_id.clone(),
+            agent_id: source_id.to_string(),
+            direction: "ask_out".to_string(),
+            data: payload.to_string(),
+            timestamp: now,
+        });
+        if report.delivered {
+            self.agent_bus.push(AgentBusMessage {
+                workspace_id: workspace_id.clone(),
+                agent_id: report.target.clone(),
+                direction: "ask_in".to_string(),
+                data: payload.to_string(),
+                timestamp: now,
+            });
+        }
+
+        report
+    }
+
+    /// Processa uma resposta (reply) de `source_id` correlacionada a uma
+    /// request. Valida workspace/emissor/timeout e entrega a `Reply` ao
+    /// requisitante original.
+    pub fn reply_to_request(
+        &self,
+        app: &tauri::AppHandle,
+        source_id: &str,
+        correlation_id: &str,
+        payload: &str,
+    ) -> DeliveryReport {
+        let (workspace_id, agents) = {
+            let guard = self.workspace.lock().expect("workspace mutex poisoned");
+            (guard.metadata.id.clone(), guard.agents.clone())
+        };
+        let now = crate::agent_bus::now_ms();
+        let transport = Arc::new(CliContextTransport);
+        let router = ContextRouter::new(transport);
+        let report = router.reply_to_request(
+            Some(app),
+            &self.pending_requests,
+            &workspace_id,
+            &agents,
+            source_id,
+            correlation_id,
+            payload,
+            now,
+        );
+
+        // Registra a resposta no barramento interno.
+        self.agent_bus.push(AgentBusMessage {
+            workspace_id: workspace_id.clone(),
+            agent_id: source_id.to_string(),
+            direction: "reply_out".to_string(),
+            data: payload.to_string(),
+            timestamp: now,
+        });
+        if report.delivered {
+            self.agent_bus.push(AgentBusMessage {
+                workspace_id: workspace_id.clone(),
+                agent_id: report.target.clone(),
+                direction: "reply_in".to_string(),
+                data: payload.to_string(),
+                timestamp: now,
+            });
+        }
+
+        report
+    }
+
+    /// Remove pedidos pendentes expirados (timeout). Retorna quantos removeu.
+    /// Evita crescimento sem limite do registro de correlação.
+    pub fn prune_expired_requests(&self, now: u64) -> usize {
+        self.pending_requests.prune_expired(now)
+    }
+
+    fn protocol_ready_key(workspace_id: &str, agent_id: &str) -> String {
+        format!("{workspace_id}\0{agent_id}")
+    }
+
+    pub fn mark_protocol_ready(&self, workspace_id: &str, agent_id: &str) {
+        self.protocol_ready
+            .lock()
+            .expect("protocol_ready mutex poisoned")
+            .insert(Self::protocol_ready_key(workspace_id, agent_id));
+    }
+
+    pub fn clear_protocol_ready(&self, workspace_id: &str, agent_id: &str) {
+        self.protocol_ready
+            .lock()
+            .expect("protocol_ready mutex poisoned")
+            .remove(&Self::protocol_ready_key(workspace_id, agent_id));
+    }
+
+    pub fn is_protocol_ready(&self, workspace_id: &str, agent_id: &str) -> bool {
+        self.protocol_ready
+            .lock()
+            .expect("protocol_ready mutex poisoned")
+            .contains(&Self::protocol_ready_key(workspace_id, agent_id))
+    }
+
+    /// Nomes dos peers conectados no canvas atual, para resposta do bridge.
+    pub fn protocol_peer_names(&self, agent_id: &str) -> Vec<String> {
+        let guard = self.workspace.lock().expect("workspace mutex poisoned");
+        crate::context_router::connected_peer_ids(&guard.edges, agent_id)
+            .into_iter()
+            .filter_map(|id| guard.agents.iter().find(|agent| agent.id == id))
+            .map(|agent| agent.name.clone())
+            .collect()
+    }
+
     /// Notifica um agente (se estiver em execução) com a lista atualizada de
     /// seus peers conectados. Usado na descoberta ao iniciar e ao criar/remover
     /// edges — a topologia do canvas é a fonte de verdade que chega ao agente.
@@ -314,7 +469,9 @@ impl AppState {
         // A notícia de identidade é sempre enviada (mesmo sem peers): todo
         // agente CLI precisa saber que roda dentro do MAESTRO 2.0.
         if self.processes.is_running_in(&workspace_id, agent_id) {
-            let _ = self.processes.send_input_in(&workspace_id, agent_id, &banner);
+            let _ = self
+                .processes
+                .send_input_in(&workspace_id, agent_id, &pty_submission(&banner));
         }
     }
 

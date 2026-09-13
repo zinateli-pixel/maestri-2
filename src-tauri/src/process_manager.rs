@@ -2,7 +2,7 @@
 //! Responsável por iniciar/parar/enviar input/redimensionar processos reais
 //! e por emitir eventos Tauri para o frontend.
 
-use crate::context_router::{ProtocolDirective, ProtocolScanner};
+use crate::context_router::{supports_agent_protocol, ProtocolDirective, ProtocolScanner};
 use crate::models::{Agent, Status};
 use crate::state::AgentBusMessage;
 use crate::runtime::{adapter_for, ProcessHandle, RuntimeError};
@@ -94,6 +94,10 @@ impl ProcessManager {
             })
             .unwrap_or_default();
 
+        if let Some(state) = app.try_state::<crate::state::AppState>() {
+            state.clear_protocol_ready(&workspace_id, &agent_id);
+        }
+
         // Evita duplicação: se já existe, retorna erro.
         {
             let guard = self.processes.lock().expect("processes mutex poisoned");
@@ -118,8 +122,45 @@ impl ProcessManager {
         let scanner = Arc::new(Mutex::new(ProtocolScanner::new()));
         let scanner_for_output = Arc::clone(&scanner);
 
-        let handle = adapter_for(agent.runtime).start(
+        #[cfg(unix)]
+        let bridge = if supports_agent_protocol(agent) {
+            Some(
+                crate::agent_bridge::start_server(
+                    app.clone(),
+                    workspace_id.clone(),
+                    agent_id.clone(),
+                )
+                .map_err(RuntimeError)?,
+            )
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let bridge_env = if let Some(bridge) = bridge.as_ref() {
+            vec![
+                (
+                    "MAESTRO2_CLI".to_string(),
+                    std::env::current_exe()
+                        .map_err(|e| RuntimeError(e.to_string()))?
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                (
+                    "MAESTRO2_SOCKET".to_string(),
+                    bridge.socket_path().to_string_lossy().to_string(),
+                ),
+                ("MAESTRO2_WORKSPACE_ID".to_string(), workspace_id.clone()),
+                ("MAESTRO2_AGENT_ID".to_string(), agent_id.clone()),
+            ]
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(unix))]
+        let bridge_env: Vec<(String, String)> = Vec::new();
+
+        let mut handle = adapter_for(agent.runtime).start_with_env(
             agent,
+            &bridge_env,
             Box::new(move |text| {
                 let agent_id = id_output.clone();
 
@@ -140,6 +181,17 @@ impl ProcessManager {
                                     &target,
                                     &payload,
                                 );
+                            }
+                        }
+                        ProtocolDirective::Ask { target, payload } => {
+                            if let Some(state) = app_route.try_state::<crate::state::AppState>() {
+                                let _ = state.ask_peer(&app_route, &agent_id, &target, &payload);
+                            }
+                        }
+                        ProtocolDirective::Reply { correlation_id, payload } => {
+                            if let Some(state) = app_route.try_state::<crate::state::AppState>() {
+                                let _ =
+                                    state.reply_to_request(&app_route, &agent_id, &correlation_id, &payload);
                             }
                         }
                         ProtocolDirective::Peers => {
@@ -187,6 +239,11 @@ impl ProcessManager {
             }),
         )?;
 
+        #[cfg(unix)]
+        if let Some(bridge) = bridge {
+            handle.attach_bridge(bridge);
+        }
+
         // Registra o handle.
         {
             let mut guard = self.processes.lock().expect("processes mutex poisoned");
@@ -233,6 +290,12 @@ impl ProcessManager {
                             .map(|ws| state.processes.is_running_in(&ws, &id_for_banner))
                             .unwrap_or(false);
                         if !running {
+                            break;
+                        }
+                        // O handshake veio pelo socket privado: não injete mais
+                        // banners no TUI e não corrompa prompts em andamento.
+                        let workspace_id = state.current_workspace_id().unwrap_or_default();
+                        if state.is_protocol_ready(&workspace_id, &id_for_banner) {
                             break;
                         }
                         state.announce_peers_to(&id_for_banner);
@@ -328,9 +391,16 @@ impl ProcessManager {
 
         // Remove o vínculo workspace -> agente ANTES do kill, para não deixar
         // entrada órfã em workspace_of caso o kill falhe.
-        {
+        let stopped_workspace = {
             let mut ws = self.workspace_of.lock().expect("workspace_of mutex poisoned");
-            ws.remove(agent_id);
+            ws.remove(agent_id)
+        };
+
+        if let (Some(workspace_id), Some(state)) = (
+            stopped_workspace,
+            app.try_state::<crate::state::AppState>(),
+        ) {
+            state.clear_protocol_ready(&workspace_id, agent_id);
         }
 
         handle.kill()?;

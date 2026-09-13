@@ -318,7 +318,7 @@ pub fn restart_agent(
             .ok_or_else(|| "agente não encontrado".to_string())?
     };
 
-    if agent.command.trim().is_empty() {
+    if agent.runtime == Runtime::Custom && agent.command.trim().is_empty() {
         return Err("comando vazio — configure o comando do agente".to_string());
     }
 

@@ -1,4 +1,5 @@
 mod agent_bus;
+pub mod agent_bridge;
 mod chain;
 mod commands;
 mod context_router;
@@ -75,6 +76,7 @@ pub fn run() {
             // Context routing (Fase 3/4)
             context_router::route_context,
             context_router::route_context_to,
+            context_router::route_context_ask,
             // Workflow chain (Fase 6/7)
             chain::run_canvas_chain,
             chain::list_workflow_events,

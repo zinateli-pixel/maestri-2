@@ -30,6 +30,14 @@ const RUNTIME_LABELS: Record<Runtime, string> = {
   custom: "Custom",
 };
 
+const RUNTIME_COMMANDS: Partial<Record<Runtime, string>> = {
+  kilo: "kilo",
+  claude_code: "claude",
+  opencode: "opencode",
+};
+
+const GENERIC_SHELLS = new Set(["", "sh", "bash", "zsh", "fish"]);
+
 interface AgentFormProps {
   initial?: Partial<CreateAgentInput>;
   submitLabel: string;
@@ -124,7 +132,14 @@ export function AgentForm({
             <select
               className="field-select"
               value={runtime}
-              onChange={(e) => setRuntime(e.target.value as Runtime)}
+              onChange={(e) => {
+                const next = e.target.value as Runtime;
+                setRuntime(next);
+                const defaultCommand = RUNTIME_COMMANDS[next];
+                if (defaultCommand && GENERIC_SHELLS.has(command.trim())) {
+                  setCommand(defaultCommand);
+                }
+              }}
             >
               {RUNTIMES.map((r) => (
                 <option key={r} value={r}>

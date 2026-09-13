@@ -63,6 +63,14 @@ export interface DeliveryReport {
   error?: string | null;
 }
 
+/** Resultado de um pedido (ask) a um peer (route_context_ask). */
+export interface AskReport {
+  target: string;
+  delivered: boolean;
+  request_id: string;
+  error?: string | null;
+}
+
 export interface Viewport {
   x: number;
   y: number;

@@ -63,6 +63,9 @@ pub struct ProcessHandle {
     shutdown: Sender<()>,
     /// Thread leitora (join handle).
     reader: Option<thread::JoinHandle<()>>,
+    /// Canal IPC agent→Maestro 2. Não depende do stdout ANSI da TUI.
+    #[cfg(unix)]
+    bridge: Option<crate::agent_bridge::BridgeServer>,
 }
 
 impl ProcessHandle {
@@ -90,6 +93,10 @@ impl ProcessHandle {
 
     /// Encerra o processo (SIGKILL) e a thread leitora.
     pub fn kill(&mut self) -> Result<(), RuntimeError> {
+        #[cfg(unix)]
+        if let Some(mut bridge) = self.bridge.take() {
+            bridge.stop();
+        }
         let _ = self.shutdown.send(());
         self.child
             .lock()
@@ -145,6 +152,21 @@ pub trait RuntimeAdapter: Send + Sync {
         on_exit: Box<dyn Fn(u32) + Send>,
     ) -> Result<ProcessHandle, RuntimeError> {
         let spec = self.resolve(agent)?;
+        spawn_pty(&spec, on_output, on_exit)
+    }
+
+    /// Inicia o runtime adicionando variáveis controladas pelo ProcessManager.
+    /// Usado pelo bridge privado do Maestro 2 sem alterar a configuração lógica
+    /// persistida do agente.
+    fn start_with_env(
+        &self,
+        agent: &Agent,
+        extra_env: &[(String, String)],
+        on_output: Box<dyn Fn(String) + Send>,
+        on_exit: Box<dyn Fn(u32) + Send>,
+    ) -> Result<ProcessHandle, RuntimeError> {
+        let mut spec = self.resolve(agent)?;
+        spec.env.extend_from_slice(extra_env);
         spawn_pty(&spec, on_output, on_exit)
     }
 }
@@ -304,7 +326,16 @@ fn spawn_pty(
         writer,
         shutdown: shutdown_tx,
         reader: Some(reader_handle),
+        #[cfg(unix)]
+        bridge: None,
     })
+}
+
+impl ProcessHandle {
+    #[cfg(unix)]
+    pub fn attach_bridge(&mut self, bridge: crate::agent_bridge::BridgeServer) {
+        self.bridge = Some(bridge);
+    }
 }
 
 /// Fallback local: executa `agent.command` + `args` em `working_dir` via PTY.
