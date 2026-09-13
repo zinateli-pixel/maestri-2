@@ -77,7 +77,7 @@ src-tauri/src/
 ## Build & teste
 - `pnpm build` — frontend (tsc + vite)
 - `cd src-tauri && cargo build` — backend dev
-- `cd src-tauri && cargo test` — 96 testes (persistência, modelos, PTY, routing, workflow, skills, MCP, memory)
+- `cd src-tauri && cargo test` — 108 testes (persistência, modelos, PTY, routing, workflow, skills, MCP, memory, projects, discovery)
 - `pnpm tauri dev` — dev com hot reload
 - `pnpm tauri build` — release (.app + .dmg)
 
@@ -93,18 +93,25 @@ src-tauri/src/
 
 ## Roadmap (role AGENTS.md, itens 1–21)
 1..5 — Estabilizar Node/Terminal/PTY, modelo Agent, connections→contexto,
-       comunicação agent↔agent, Agent Protocol: CONCLUÍDO.
+       comunicação agent↔agent, Agent Protocol: CONCLUÍDO (inclui hardening
+       da Fase 4: banner de identidade "MAESTRO 2.0" + canvas como fonte de
+       verdade, proibição de maestri list/ask/OmniRoute e retry finito).
 6..8  — Workflow Engine, eventos/estados, persistência local: CONCLUÍDO.
 9..10 — Skills (backend + UI) e MCP Manager (backend + UI): CONCLUÍDO.
-11    — Memory: backend CONCLUÍDO; integração de frontend em andamento.
-12    — Workspaces/Projects: Workspaces CONCLUÍDO; Projects (agrupamento)
-       em DRAFT backend-only, ainda SEM UI (não validado).
+11    — Memory: CONCLUÍDO (backend + frontend: types, store e aba no painel).
+12    — Workspaces/Projects: CONCLUÍDO (backend + frontend: types, store e
+       aba "Projects" no painel de capabilidades).
 13    — Runtime Adapters reais (Kilo, Claude Code, OpenCode) além do
-       LocalShellAdapter: PENDENTE (próxima após fechar 11/12).
+       LocalShellAdapter (Custom): CONCLUÍDO. Codex/Cline sem variante
+       dedicada — Cline roda via Custom com `command: "cline"`.
 14+   — Web/App Agents, Computer Control, Security, History, Templates,
        Cloud/Supabase, Marketplace: PENDENTE.
 
 ## Próxima fase (ordem real do roadmap)
-1. Fechar integração do Memory no frontend (types + store + UI).
-2. Decidir/validar a camada de Projects (manter ou remover) + UI.
-3. Runtime Adapters reais (Kilo, Claude Code, OpenCode) — item 13.
+1. Runtime Adapter `Codex` (variante `Runtime::Codex` + `CodexAdapter`) —
+   extensão do item 13, seguindo o padrão do `OpenCodeAdapter`.
+2. Fase 14 — Web Agents (AgentKind::Web já existe; criar adapter web
+   separado dos CLI, lifecycle, RoutedMessage com workspace_id, integração
+   ao Workflow Engine, persistência/reload, isolamento e mock para testes).
+3. Fases 15+ — App Agents, Computer Control, Permissions/Security,
+   History/Replay, Templates, Cloud/Supabase, Marketplace.

@@ -107,6 +107,13 @@ impl ProcessHandle {
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
+        // A thread leitora não coleta o status em shutdown intencional; faça
+        // o reap aqui para não deixar processo zumbi.
+        let _ = self
+            .child
+            .lock()
+            .expect("child mutex poisoned")
+            .wait();
         Ok(())
     }
 
@@ -259,8 +266,10 @@ fn spawn_pty(
     // ao detectar EOF, aguarda o child e dispara on_exit.
     let reader_handle = thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let mut shutdown_requested = false;
         loop {
             if shutdown_rx.try_recv().is_ok() {
+                shutdown_requested = true;
                 break;
             }
             match reader.read(&mut buf) {
@@ -271,6 +280,13 @@ fn spawn_pty(
                 }
                 Err(_) => break,
             }
+        }
+        // `kill()` fecha o master PTY para desbloquear `read()`. Nesse caso a
+        // saída é intencional e o ProcessManager emitirá (ou suprimirá, em um
+        // restart) o evento correto. Não deixe o callback do processo antigo
+        // disputar com os eventos RUNNING do processo recém-criado.
+        if shutdown_requested || shutdown_rx.try_recv().is_ok() {
+            return;
         }
         // Processo terminou (EOF): coleta o status e notifica.
         let status = child_for_thread
@@ -503,9 +519,10 @@ mod tests {
         // Encerra o processo (kill).
         handle.kill().expect("kill deve funcionar");
 
-        // O exit code deve ter sido notificado (SIGKILL => não zero).
-        // Apenas garante que a thread de exit não ficou presa.
+        // Shutdown intencional não deve disparar o callback de saída do
+        // processo antigo: esse evento competiria com um refresh/restart.
         std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(*exited.lock().unwrap(), None);
     }
 
     /// Prova que o dispatcher (`adapter_for`) seleciona o adapter correto e que

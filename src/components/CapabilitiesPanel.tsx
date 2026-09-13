@@ -5,11 +5,12 @@ import type {
   McpServer,
   McpTransport,
   MemoryEntry,
+  Project,
   Skill,
   WorkflowEvent,
 } from "../types/models";
 
-type Tab = "workflow" | "skills" | "mcp" | "memory";
+type Tab = "workflow" | "skills" | "mcp" | "memory" | "projects";
 
 const EVENT_LABEL: Record<string, string> = {
   workflow_started: "iniciado",
@@ -26,6 +27,7 @@ function fmt(ts: number): string {
 
 export function CapabilitiesPanel({ onClose }: { onClose: () => void }) {
   const agents = useWorkspaceStore((s) => s.state?.agents ?? []);
+  const currentWorkspaceId = useWorkspaceStore((s) => s.currentWorkspaceId);
   const runChain = useWorkspaceStore((s) => s.runChain);
   const listWorkflowEvents = useWorkspaceStore((s) => s.listWorkflowEvents);
   const listSkills = useWorkspaceStore((s) => s.listSkills);
@@ -39,6 +41,12 @@ export function CapabilitiesPanel({ onClose }: { onClose: () => void }) {
   const listMemory = useWorkspaceStore((s) => s.listMemory);
   const createMemory = useWorkspaceStore((s) => s.createMemory);
   const removeMemory = useWorkspaceStore((s) => s.removeMemory);
+  const listProjects = useWorkspaceStore((s) => s.listProjects);
+  const createProject = useWorkspaceStore((s) => s.createProject);
+  const renameProject = useWorkspaceStore((s) => s.renameProject);
+  const deleteProject = useWorkspaceStore((s) => s.deleteProject);
+  const addWorkspaceToProject = useWorkspaceStore((s) => s.addWorkspaceToProject);
+  const removeWorkspaceFromProject = useWorkspaceStore((s) => s.removeWorkspaceFromProject);
 
   const [tab, setTab] = useState<Tab>("workflow");
 
@@ -73,22 +81,28 @@ export function CapabilitiesPanel({ onClose }: { onClose: () => void }) {
   const [memContent, setMemContent] = useState("");
   const [memAgentId, setMemAgentId] = useState("");
 
+  // Projects (Fase 12)
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectName, setProjectName] = useState("");
+
   const refresh = useCallback(async () => {
     try {
-      const [s, m, e, mm] = await Promise.all([
+      const [s, m, e, mm, pj] = await Promise.all([
         listSkills(),
         listMcpServers(),
         listWorkflowEvents(),
         listMemory(),
+        listProjects(),
       ]);
       setSkills(s);
       setMcps(m);
       setEvents(e);
       setMemories(mm);
+      setProjects(pj);
     } catch (e) {
       console.error("CapabilitiesPanel refresh:", e);
     }
-  }, [listSkills, listMcpServers, listWorkflowEvents, listMemory]);
+  }, [listSkills, listMcpServers, listWorkflowEvents, listMemory, listProjects]);
 
   useEffect(() => {
     void refresh();
@@ -155,13 +169,13 @@ export function CapabilitiesPanel({ onClose }: { onClose: () => void }) {
       </div>
 
       <div style={{ display: "flex", gap: "var(--space-2)", padding: "0 var(--space-3)" }}>
-        {(["workflow", "skills", "mcp", "memory"] as Tab[]).map((t) => (
+        {(["workflow", "skills", "mcp", "memory", "projects"] as Tab[]).map((t) => (
           <button
             key={t}
             className={t === tab ? "btn btn-primary btn-sm" : "btn btn-ghost btn-sm"}
             onClick={() => setTab(t)}
           >
-            {t === "workflow" ? "Workflow" : t === "skills" ? "Skills" : t === "mcp" ? "MCP" : "Memory"}
+            {t === "workflow" ? "Workflow" : t === "skills" ? "Skills" : t === "mcp" ? "MCP" : t === "memory" ? "Memory" : "Projects"}
           </button>
         ))}
       </div>
@@ -535,6 +549,111 @@ export function CapabilitiesPanel({ onClose }: { onClose: () => void }) {
                 <button className="icon-btn" onClick={() => removeMemory(m.id).then(refresh)} title="Remover">
                   🗑
                 </button>
+              </div>
+            ))}
+          </>
+        )}
+
+        {tab === "projects" && (
+          <>
+            <div className="panel-section-title">Novo projeto</div>
+            <label className="field">
+              <span className="field-label">Nome</span>
+              <input
+                className="field-input"
+                value={projectName}
+                onChange={(e) => setProjectName(e.target.value)}
+                placeholder="ex.: Cliente X"
+              />
+            </label>
+            <button
+              className="btn btn-primary"
+              onClick={async () => {
+                if (!projectName.trim()) return;
+                await createProject({ name: projectName.trim() });
+                setProjectName("");
+                await refresh();
+              }}
+            >
+              ＋ Criar projeto
+            </button>
+
+            <div className="panel-divider" />
+            <div className="panel-section-title">Projetos ({projects.length})</div>
+            {projects.length === 0 && (
+              <div style={{ color: "var(--color-text-subtle)", fontSize: "var(--text-xs)" }}>
+                Nenhum projeto ainda.
+              </div>
+            )}
+            {projects.map((p) => (
+              <div
+                key={p.id}
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: "var(--space-2)",
+                  padding: "var(--space-2) var(--space-3)",
+                  background: "var(--color-bg-base)",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: "var(--text-sm)",
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 600 }}>{p.name}</div>
+                  <div style={{ color: "var(--color-text-subtle)", fontSize: "var(--text-xs)" }}>
+                    {p.workspace_ids.length} workspace(s)
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
+                  {currentWorkspaceId &&
+                    (p.workspace_ids.includes(currentWorkspaceId) ? (
+                      <button
+                        className="icon-btn"
+                        title="Remover workspace atual do projeto"
+                        onClick={() =>
+                          removeWorkspaceFromProject({
+                            project_id: p.id,
+                            workspace_id: currentWorkspaceId,
+                          }).then(refresh)
+                        }
+                      >
+                        ➖
+                      </button>
+                    ) : (
+                      <button
+                        className="icon-btn"
+                        title="Associar workspace atual ao projeto"
+                        onClick={() =>
+                          addWorkspaceToProject({
+                            project_id: p.id,
+                            workspace_id: currentWorkspaceId,
+                          }).then(refresh)
+                        }
+                      >
+                        ＋
+                      </button>
+                    ))}
+                  <button
+                    className="icon-btn"
+                    title="Renomear projeto"
+                    onClick={() => {
+                      const name =
+                        typeof window.prompt === "function"
+                          ? window.prompt("Novo nome:", p.name ?? "")
+                          : "";
+                      if (name?.trim())
+                        renameProject({ id: p.id, name: name.trim() })
+                          .then(refresh)
+                          .catch((err) => console.error(err));
+                    }}
+                  >
+                    ✏️
+                  </button>
+                  <button className="icon-btn" title="Remover projeto" onClick={() => deleteProject(p.id).then(refresh)}>
+                    🗑
+                  </button>
+                </div>
               </div>
             ))}
           </>

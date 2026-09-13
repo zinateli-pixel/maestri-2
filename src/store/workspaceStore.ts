@@ -14,6 +14,10 @@ import type {
   RenameWorkspaceInput,
   UpdateWorkspaceSettingsInput,
   UpdateViewportInput,
+  Project,
+  CreateProjectInput,
+  RenameProjectInput,
+  ProjectWorkspaceInput,
   Skill,
   CreateSkillInput,
   McpServer,
@@ -64,6 +68,8 @@ interface WorkspaceStore {
   workspaces: WorkspaceListItem[];
   /** ID do workspace atualmente carregado. */
   currentWorkspaceId: string | null;
+  /** Lista de projetos disponíveis (Fase 12). */
+  projects: Project[];
 
   load: () => Promise<void>;
   createAgent: (input: CreateAgentInput) => Promise<Agent>;
@@ -118,6 +124,14 @@ interface WorkspaceStore {
   updateViewport: (input: UpdateViewportInput) => Promise<void>;
   setCurrentWorkspace: (workspace: WorkspaceState) => void;
 
+  // Projects (Fase 12)
+  listProjects: () => Promise<Project[]>;
+  createProject: (input: CreateProjectInput) => Promise<Project>;
+  renameProject: (input: RenameProjectInput) => Promise<Project>;
+  deleteProject: (id: string) => Promise<void>;
+  addWorkspaceToProject: (input: ProjectWorkspaceInput) => Promise<Project>;
+  removeWorkspaceFromProject: (input: ProjectWorkspaceInput) => Promise<Project>;
+
   undo: () => Promise<void>;
   redo: () => Promise<void>;
   exportWorkspace: () => Promise<string>;
@@ -171,6 +185,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     future: [],
     workspaces: [],
     currentWorkspaceId: null,
+    projects: [],
 
     load: async () => {
       set({ loading: true, error: null });
@@ -180,6 +195,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
 
         // Carrega a lista de workspaces para o seletor
         get().loadWorkspaces();
+        get().listProjects().catch(() => {});
 
         // Auto-start agents configurados com auto_start: true
         if (state) {
@@ -332,6 +348,53 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
 
     setCurrentWorkspace: (workspace) => {
       set({ state: workspace, currentWorkspaceId: workspace.metadata.id });
+    },
+
+    // Projects (Fase 12)
+    listProjects: async () => {
+      const projects = await invoke<Project[]>("list_projects");
+      set({ projects });
+      return projects;
+    },
+
+    createProject: async (input) => {
+      const project = await invoke<Project>("create_project", { input });
+      set((s) => ({ projects: [...s.projects, project] }));
+      get().pushToast(`Projeto "${project.name}" criado`, "success");
+      return project;
+    },
+
+    renameProject: async (input) => {
+      const project = await invoke<Project>("rename_project", { input });
+      set((s) => ({
+        projects: s.projects.map((p) => (p.id === input.id ? project : p)),
+      }));
+      get().pushToast(`Projeto renomeado para "${project.name}"`, "success");
+      return project;
+    },
+
+    deleteProject: async (id) => {
+      await invoke<void>("delete_project", { id });
+      set((s) => ({ projects: s.projects.filter((p) => p.id !== id) }));
+      get().pushToast("Projeto deletado", "info");
+    },
+
+    addWorkspaceToProject: async (input) => {
+      const project = await invoke<Project>("add_workspace_to_project", { input });
+      set((s) => ({
+        projects: s.projects.map((p) => (p.id === input.project_id ? project : p)),
+      }));
+      get().pushToast(`Workspace associado ao projeto "${project.name}"`, "success");
+      return project;
+    },
+
+    removeWorkspaceFromProject: async (input) => {
+      const project = await invoke<Project>("remove_workspace_from_project", { input });
+      set((s) => ({
+        projects: s.projects.map((p) => (p.id === input.project_id ? project : p)),
+      }));
+      get().pushToast(`Workspace removido do projeto "${project.name}"`, "info");
+      return project;
     },
 
     createAgent: async (input) => {

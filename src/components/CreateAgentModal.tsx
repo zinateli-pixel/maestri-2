@@ -66,7 +66,7 @@ const TEMPLATES: Array<{
     role: "reviewer",
     command: "opencode",
     args: [],
-    runtime: "custom",
+    runtime: "opencode",
     model: "OpenCode",
   },
   {

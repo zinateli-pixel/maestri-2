@@ -16,7 +16,7 @@
 //! EXPLÍCITO, via o comando `route_context` (ou futuramente pelo protocolo/
 //! workflow engine).
 
-use crate::models::{Agent, AgentKind, Edge};
+use crate::models::{Agent, AgentKind, Edge, Runtime};
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -561,6 +561,25 @@ pub fn build_peers_banner(agents: &[Agent], edges: &[Edge], source_id: &str) -> 
     };
 
     format!("{}{}{}", IDENTITY_HEADER, DIRECTIVE_HINTS, peers_line)
+}
+
+/// O Agent Protocol é uma conversa com um agente, não texto de inicialização
+/// para um shell genérico. Runtimes conhecidos sempre suportam o protocolo;
+/// no runtime Custom, limita a injeção a CLIs de agentes conhecidas.
+pub fn supports_agent_protocol(agent: &Agent) -> bool {
+    if agent.runtime != Runtime::Custom {
+        return true;
+    }
+
+    let command = std::path::Path::new(agent.command.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        command.as_str(),
+        "aider" | "claude" | "cline" | "codex" | "kilo" | "opencode"
+    )
 }
 
 fn now_ms() -> u64 {
@@ -1139,6 +1158,21 @@ mod tests {
         let res = sc.feed(&banner);
         assert!(res.directives.is_empty());
         assert!(!res.forward.is_empty());
+    }
+
+    #[test]
+    fn protocol_banner_is_not_injected_into_generic_shells() {
+        for shell in ["sh", "bash", "/bin/zsh", "fish"] {
+            let agent = cli_agent_named("a1", "Shell");
+            let mut agent = Agent { command: shell.to_string(), ..agent };
+            agent.runtime = Runtime::Custom;
+            assert!(!supports_agent_protocol(&agent), "shell {shell} deve ser ignorado");
+        }
+
+        let mut codex = cli_agent_named("a1", "Codex");
+        codex.runtime = Runtime::Custom;
+        codex.command = "/usr/local/bin/codex".to_string();
+        assert!(supports_agent_protocol(&codex));
     }
 
     #[test]

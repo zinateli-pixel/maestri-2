@@ -1,5 +1,5 @@
 use crate::models::{Agent, AgentKind, Edge, EdgeType, Role, Runtime, Status, Viewport, WorkspaceListItem, WorkspaceSettings, WorkspaceState};
-use crate::context_router::{build_peers_banner, CliContextTransport, ContextRouter, DeliveryReport};
+use crate::context_router::{build_peers_banner, supports_agent_protocol, CliContextTransport, ContextRouter, DeliveryReport};
 use crate::events::{WorkflowEvent, WorkflowEventLog};
 use crate::persistence::Persistence;
 use crate::process_manager::ProcessManager;
@@ -300,6 +300,12 @@ impl AppState {
     pub fn announce_peers_to(&self, agent_id: &str) {
         let (workspace_id, banner) = {
             let guard = self.workspace.lock().expect("workspace mutex poisoned");
+            let Some(agent) = guard.agents.iter().find(|agent| agent.id == agent_id) else {
+                return;
+            };
+            if !supports_agent_protocol(agent) {
+                return;
+            }
             (
                 guard.metadata.id.clone(),
                 build_peers_banner(&guard.agents, &guard.edges, agent_id),

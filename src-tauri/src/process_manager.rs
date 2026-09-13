@@ -301,6 +301,22 @@ impl ProcessManager {
 
     /// Para o processo de um agente (SIGKILL) e remove do mapa.
     pub fn stop(&self, app: &AppHandle, agent_id: &str) -> Result<(), RuntimeError> {
+        self.stop_impl(app, agent_id, true)
+    }
+
+    /// Cleanup usado por refresh/restart. Não emite `agent_stopped`: o mesmo
+    /// comando iniciará outro processo imediatamente, e eventos de canais
+    /// diferentes podem chegar ao frontend fora de ordem.
+    pub fn stop_for_restart(&self, app: &AppHandle, agent_id: &str) -> Result<(), RuntimeError> {
+        self.stop_impl(app, agent_id, false)
+    }
+
+    fn stop_impl(
+        &self,
+        app: &AppHandle,
+        agent_id: &str,
+        emit_stopped: bool,
+    ) -> Result<(), RuntimeError> {
         eprintln!("[PROCESS_MGR] stop begin agent_id={}", agent_id);
         let mut handle = {
             let mut guard = self.processes.lock().expect("processes mutex poisoned");
@@ -320,13 +336,15 @@ impl ProcessManager {
         handle.kill()?;
         eprintln!("[PROCESS_MGR] stop: kill() returned");
 
-        let _ = app.emit(
-            EVENT_AGENT_STOPPED,
-            AgentEvent {
-                agent_id: agent_id.to_string(),
-                data: "stopped".to_string(),
-            },
-        );
+        if emit_stopped {
+            let _ = app.emit(
+                EVENT_AGENT_STOPPED,
+                AgentEvent {
+                    agent_id: agent_id.to_string(),
+                    data: "stopped".to_string(),
+                },
+            );
+        }
         eprintln!("[PROCESS_MGR] stop complete");
         Ok(())
     }

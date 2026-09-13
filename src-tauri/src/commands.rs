@@ -303,7 +303,7 @@ pub fn restart_agent(
     id: String,
 ) -> Result<(), String> {
     // Para se estiver rodando (ignora erro se não estiver).
-    let _ = state.processes.stop(&app, &id);
+    let _ = state.processes.stop_for_restart(&app, &id);
 
     let agent = {
         let guard = state
@@ -365,7 +365,7 @@ pub fn refresh_agent(
 
     // 2. Para processo existente se houver (cleanup completo)
     eprintln!("[REFRESH] stopping existing process...");
-    let _ = state.processes.stop(&app, &id);
+    let _ = state.processes.stop_for_restart(&app, &id);
     eprintln!("[REFRESH] stop returned");
 
     // 3. Atualiza status para Starting

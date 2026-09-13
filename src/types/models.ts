@@ -158,6 +158,36 @@ export interface UpdateViewportInput {
 }
 
 // ---------------------------------------------------------------------------
+// Projects (Fase 12)
+// ---------------------------------------------------------------------------
+
+/** Um Projeto agrupa múltiplos workspaces (camada organizacional). */
+export interface Project {
+  id: string;
+  name: string;
+  workspace_ids: string[];
+  created_at: number;
+  updated_at: number;
+}
+
+/** Payload para criar um projeto. */
+export interface CreateProjectInput {
+  name: string;
+}
+
+/** Payload para renomear um projeto. */
+export interface RenameProjectInput {
+  id: string;
+  name: string;
+}
+
+/** Payload para associar/desassociar um workspace a um projeto. */
+export interface ProjectWorkspaceInput {
+  project_id: string;
+  workspace_id: string;
+}
+
+// ---------------------------------------------------------------------------
 // Skills (Fase 9)
 // ---------------------------------------------------------------------------
 
