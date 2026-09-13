@@ -391,12 +391,26 @@ impl RuntimeAdapter for OpenCodeAdapter {
     }
 }
 
+/// Adapter para Codex (OpenAI Codex CLI).
+pub struct CodexAdapter;
+
+impl RuntimeAdapter for CodexAdapter {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn resolve(&self, agent: &Agent) -> Result<SpawnSpec, RuntimeError> {
+        resolve_cli(agent, Some("codex"), "Codex")
+    }
+}
+
 /// Seleciona o adapter correspondente ao `Runtime` configurado do agente.
 pub fn adapter_for(runtime: Runtime) -> Box<dyn RuntimeAdapter> {
     match runtime {
         Runtime::Kilo => Box::new(KiloAdapter),
         Runtime::ClaudeCode => Box::new(ClaudeCodeAdapter),
         Runtime::OpenCode => Box::new(OpenCodeAdapter),
+        Runtime::Codex => Box::new(CodexAdapter),
         Runtime::Custom => Box::new(LocalShellAdapter),
     }
 }
@@ -440,6 +454,7 @@ mod tests {
         assert_eq!(adapter_for(Runtime::Kilo).name(), "kilo");
         assert_eq!(adapter_for(Runtime::ClaudeCode).name(), "claude_code");
         assert_eq!(adapter_for(Runtime::OpenCode).name(), "opencode");
+        assert_eq!(adapter_for(Runtime::Codex).name(), "codex");
         assert_eq!(adapter_for(Runtime::Custom).name(), "local_shell");
     }
 

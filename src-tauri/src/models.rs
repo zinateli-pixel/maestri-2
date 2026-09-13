@@ -40,6 +40,7 @@ pub enum Runtime {
     ClaudeCode,
     #[serde(rename = "opencode")]
     OpenCode,
+    Codex,
     Custom,
 }
 
@@ -50,6 +51,7 @@ impl Runtime {
             Runtime::Kilo => "kilo",
             Runtime::ClaudeCode => "claude_code",
             Runtime::OpenCode => "opencode",
+            Runtime::Codex => "codex",
             Runtime::Custom => "custom",
         }
     }
@@ -674,6 +676,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&Runtime::ClaudeCode).unwrap(), "\"claude_code\"");
         assert_eq!(serde_json::to_string(&Runtime::Kilo).unwrap(), "\"kilo\"");
         assert_eq!(serde_json::to_string(&Runtime::OpenCode).unwrap(), "\"opencode\"");
+        assert_eq!(serde_json::to_string(&Runtime::Codex).unwrap(), "\"codex\"");
         assert_eq!(serde_json::to_string(&Runtime::Custom).unwrap(), "\"custom\"");
         assert_eq!(serde_json::to_string(&Status::Starting).unwrap(), "\"starting\"");
         assert_eq!(serde_json::to_string(&EdgeType::Workflow).unwrap(), "\"workflow\"");

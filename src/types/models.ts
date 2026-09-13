@@ -9,7 +9,7 @@ export type Role =
   | "qa"
   | "observer";
 
-export type Runtime = "kilo" | "claude_code" | "opencode" | "custom";
+export type Runtime = "kilo" | "claude_code" | "opencode" | "codex" | "custom";
 
 export type AgentKind = "cli" | "web" | "app";
 

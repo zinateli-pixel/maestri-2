@@ -11,7 +11,7 @@ const ROLES: Role[] = [
   "observer",
 ];
 
-const RUNTIMES: Runtime[] = ["kilo", "claude_code", "opencode", "custom"];
+const RUNTIMES: Runtime[] = ["kilo", "claude_code", "opencode", "codex", "custom"];
 
 const ROLE_LABELS: Record<Role, string> = {
   orchestrator: "Orchestrator",
@@ -27,6 +27,7 @@ const RUNTIME_LABELS: Record<Runtime, string> = {
   kilo: "Kilo",
   claude_code: "Claude Code",
   opencode: "OpenCode",
+  codex: "Codex",
   custom: "Custom",
 };
 
@@ -34,6 +35,7 @@ const RUNTIME_COMMANDS: Partial<Record<Runtime, string>> = {
   kilo: "kilo",
   claude_code: "claude",
   opencode: "opencode",
+  codex: "codex",
 };
 
 const GENERIC_SHELLS = new Set(["", "sh", "bash", "zsh", "fish"]);
