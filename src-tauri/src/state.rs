@@ -305,9 +305,8 @@ impl AppState {
                 build_peers_banner(&guard.agents, &guard.edges, agent_id),
             )
         };
-        if banner.is_empty() {
-            return;
-        }
+        // A notícia de identidade é sempre enviada (mesmo sem peers): todo
+        // agente CLI precisa saber que roda dentro do MAESTRO 2.0.
         if self.processes.is_running_in(&workspace_id, agent_id) {
             let _ = self.processes.send_input_in(&workspace_id, agent_id, &banner);
         }

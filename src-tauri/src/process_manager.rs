@@ -17,10 +17,24 @@ pub const EVENT_AGENT_STOPPED: &str = "agent_stopped";
 pub const EVENT_AGENT_ERROR: &str = "agent_error";
 pub const EVENT_AGENT_STATUS_CHANGED: &str = "agent_status_changed";
 
-/// Atraso (ms) antes de injetar a mensagem de descoberta de peers no agente.
-/// Dá tempo para a TUI (opencode/claude/cline/kilo) terminar de iniciar e
-/// ficar no prompt, evitando que o texto seja descartado durante o boot.
+/// Atraso base (ms) antes de injetar a mensagem de descoberta de peers no
+/// agente. Dá tempo para a TUI (opencode/claude/cline/kilo) terminar de iniciar
+/// e ficar no prompt, evitando que o texto seja descartado durante o boot.
 pub const DISCOVERY_INJECT_DELAY_MS: u64 = 2000;
+
+/// Número máximo de tentativas de reanúncio da descoberta após o boot.
+/// Valor FINITO: impede loop/spam infinito de injeção no stdin do agente.
+pub const DISCOVERY_MAX_ATTEMPTS: usize = 3;
+
+/// Sequência de atrasos (ms) das tentativas de descoberta. A primeira ocorre
+/// após `DISCOVERY_INJECT_DELAY_MS`, e cada tentativa seguinte soma o atraso
+/// base (backoff linear), cobrindo boot lento da TUI sem nunca repetir para
+/// sempre. Total de `DISCOVERY_MAX_ATTEMPTS` itens, sempre crescentes e > 0.
+pub fn discovery_attempt_delays() -> Vec<u64> {
+    (0..DISCOVERY_MAX_ATTEMPTS)
+        .map(|i| DISCOVERY_INJECT_DELAY_MS.saturating_mul(i as u64 + 1))
+        .collect()
+}
 
 /// Payload de evento genérico: `{ agentId, data }`.
 #[derive(Clone, serde::Serialize)]
@@ -201,17 +215,28 @@ impl ProcessManager {
         );
 
         // Descoberta (Fase 4): anuncia ao agente, APÓS a TUI terminar de iniciar,
-        // quais são seus peers conectados e como enviar contexto a eles. O atraso
-        // evita que a mensagem seja descartada durante o boot da TUI.
+        // a identidade do MAESTRO 2.0 e seus peers conectados. O atraso evita que
+        // a mensagem seja descartada durante o boot da TUI; o reanúncio é FINITO
+        // (DISCOVERY_MAX_ATTEMPTS) com backoff crescente, sem loop/spam infinito.
         {
             let app_for_banner = app.clone();
             let id_for_banner = agent_id.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    DISCOVERY_INJECT_DELAY_MS,
-                ));
-                if let Some(state) = app_for_banner.try_state::<crate::state::AppState>() {
-                    state.announce_peers_to(&id_for_banner);
+                for delay in discovery_attempt_delays() {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    if let Some(state) = app_for_banner.try_state::<crate::state::AppState>() {
+                        // Interrompe se o processo não pertence mais ao workspace
+                        // atual (parou ou trocou de workspace) — sem entregar a
+                        // notícia a um processo de outro workspace.
+                        let running = state
+                            .current_workspace_id()
+                            .map(|ws| state.processes.is_running_in(&ws, &id_for_banner))
+                            .unwrap_or(false);
+                        if !running {
+                            break;
+                        }
+                        state.announce_peers_to(&id_for_banner);
+                    }
                 }
             });
         }
@@ -371,5 +396,22 @@ mod tests {
             .unwrap()
             .insert("agent-x".to_string(), "ws-B".to_string());
         assert!(pm.resize_in("ws-A", "agent-x", 80, 24).is_err());
+    }
+
+    #[test]
+    fn discovery_retry_schedule_is_finite_and_increasing() {
+        let delays = discovery_attempt_delays();
+
+        // Exatamente o número máximo de tentativas (nunca infinito).
+        assert_eq!(delays.len(), DISCOVERY_MAX_ATTEMPTS);
+
+        // Atrasos estritamente crescentes => backoff sem loop fechado.
+        assert!(delays.windows(2).all(|w| w[0] < w[1]));
+
+        // O primeiro tenta após o atraso base da TUI.
+        assert_eq!(delays[0], DISCOVERY_INJECT_DELAY_MS);
+
+        // Todos positivos (nada de sleep zero/tight loop).
+        assert!(delays.iter().all(|&d| d > 0));
     }
 }
