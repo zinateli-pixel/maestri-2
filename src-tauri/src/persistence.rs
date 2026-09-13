@@ -1,6 +1,7 @@
 use crate::events::WorkflowEvent;
 use crate::memory::MemoryEntry;
 use crate::models::{Agent, Edge, Project, Viewport, WorkspaceListItem, WorkspaceMetadata, WorkspaceSettings, WorkspaceState};
+use crate::permissions::PermissionGrant;
 use crate::workflow::{WorkflowDefinition, WorkflowExecution};
 use std::fs;
 use std::path::PathBuf;
@@ -134,9 +135,10 @@ impl Persistence {
             .map_err(|e| format!("falha ao serializar índice: {e}"))?;
         fs::write(index_path(&self.app_data_dir), raw).map_err(|e| format!("falha ao gravar índice: {e}"))?;
 
-        // Remove arquivos auxiliares (eventos e memória) do workspace.
+        // Remove arquivos auxiliares (eventos, memória e permissões) do workspace.
         self.delete_events(workspace_id);
         self.delete_memory_file(workspace_id);
+        self.delete_permissions_file(workspace_id);
 
         Ok(())
     }
@@ -446,6 +448,62 @@ impl Persistence {
     /// Remove as memórias persistidas de um workspace (limpeza ao deletar).
     pub fn delete_memory_file(&self, workspace_id: &str) {
         let path = self.memory_path(workspace_id);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    // ==================== PERMISSIONS PERSISTENCE ====================
+
+    fn permissions_dir(&self) -> PathBuf {
+        self.app_data_dir.join("permissions")
+    }
+
+    fn permissions_path(&self, workspace_id: &str) -> PathBuf {
+        self.permissions_dir().join(format!("{}.json", workspace_id))
+    }
+
+    /// Carrega as permissões persistidas de TODOS os workspaces.
+    pub fn load_all_permissions(&self) -> Result<Vec<PermissionGrant>, String> {
+        let dir = self.permissions_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut all = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| format!("falha ao listar permissões: {e}"))? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if let Ok(grants) = serde_json::from_str::<Vec<PermissionGrant>>(&raw) {
+                    all.extend(grants);
+                }
+            }
+        }
+        Ok(all)
+    }
+
+    /// Salva as permissões de um workspace com rename atômico.
+    pub fn save_permissions(&self, workspace_id: &str, grants: &[PermissionGrant]) -> Result<(), String> {
+        let dir = self.permissions_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("falha ao criar diretório de permissões: {e}"))?;
+        let raw = serde_json::to_string_pretty(grants)
+            .map_err(|e| format!("falha ao serializar permissões: {e}"))?;
+        let path = self.permissions_path(workspace_id);
+        let tmp = dir.join(format!("{}.tmp", workspace_id));
+        fs::write(&tmp, raw).map_err(|e| format!("falha ao gravar permissões: {e}"))?;
+        fs::rename(&tmp, &path)
+            .map_err(|e| format!("falha ao finalizar gravação de permissões: {e}"))
+    }
+
+    /// Remove as permissões persistidas de um workspace.
+    pub fn delete_permissions_file(&self, workspace_id: &str) {
+        let path = self.permissions_path(workspace_id);
         if path.exists() {
             let _ = fs::remove_file(&path);
         }
@@ -980,6 +1038,25 @@ mod tests {
         let all = p2.load_all_memory().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].content, "persiste");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permissions_survive_reload_new_instance() {
+        let dir = temp_dir();
+        let p = Persistence::new(dir.clone());
+        let grants = vec![PermissionGrant {
+            workspace_id: "ws-A".to_string(),
+            agent_id: "a1".to_string(),
+            permission: crate::permissions::Permission::BrowserControl,
+        }];
+        p.save_permissions("ws-A", &grants).unwrap();
+
+        let p2 = Persistence::new(dir.clone());
+        let all = p2.load_all_permissions().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].agent_id, "a1");
+        assert_eq!(all[0].permission, crate::permissions::Permission::BrowserControl);
         let _ = fs::remove_dir_all(&dir);
     }
 }

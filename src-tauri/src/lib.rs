@@ -9,6 +9,7 @@ mod mcp;
 mod memory;
 mod models;
 mod persistence;
+mod permissions;
 mod process_manager;
 mod runtime;
 mod skills;
@@ -102,6 +103,12 @@ pub fn run() {
             memory::memory_shared,
             memory::create_memory,
             memory::remove_memory,
+            // Permissions / Security (Fase 17)
+            permissions::list_permissions,
+            permissions::permissions_of_agent,
+            permissions::grant_permission,
+            permissions::revoke_permission,
+            permissions::check_permission,
             // Workspace management
             commands::list_workspaces,
             commands::create_workspace,

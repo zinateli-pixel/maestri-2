@@ -79,6 +79,9 @@ pub struct AppState {
     /// Sessões de aplicativo ativas (Fase 15 — AgentKind::App), isoladas por workspace.
     pub app_sessions: crate::app_agent::AppSessionManager,
 
+    /// Registro de permissões de segurança (Fase 17), escopado por workspace.
+    pub permissions: crate::permissions::PermissionRegistry,
+
     /// Barramento interno de comunicação entre agentes.
     pub agent_bus: AgentBusState,
 
@@ -137,6 +140,10 @@ impl AppState {
         let mut workflow_events = WorkflowEventLog::new();
         workflow_events.extend(persistence.load_all_events().unwrap_or_default());
 
+        // Hidrata as permissões de segurança persistidas.
+        let permissions = crate::permissions::PermissionRegistry::new();
+        permissions.load(&persistence.load_all_permissions().unwrap_or_default());
+
         Self {
             workspace: Mutex::new(workspace),
             current_workspace_id: Mutex::new(Some(workspace_id)),
@@ -146,6 +153,7 @@ impl AppState {
             processes: ProcessManager::new(),
             web_sessions: crate::web_agent::WebSessionManager::new(),
             app_sessions: crate::app_agent::AppSessionManager::new(),
+            permissions,
             agent_bus: AgentBusState::new(),
             delivered_ids: Mutex::new(HashSet::new()),
             protocol_ready: Mutex::new(HashSet::new()),
