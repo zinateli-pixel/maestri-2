@@ -3,6 +3,7 @@ pub mod agent_bridge;
 mod app_agent;
 mod chain;
 mod commands;
+mod computer_control;
 mod context_router;
 mod events;
 mod mcp;
@@ -109,6 +110,8 @@ pub fn run() {
             permissions::grant_permission,
             permissions::revoke_permission,
             permissions::check_permission,
+            // Computer Control (Fase 16)
+            computer_control::computer_action,
             // Workspace management
             commands::list_workspaces,
             commands::create_workspace,

@@ -313,3 +313,39 @@ export interface ChainExecution {
   events: WorkflowEvent[];
   error?: string | null;
 }
+
+// ---------------------------------------------------------------------------
+// Permissions / Security (Fase 17) + Computer Control (Fase 16)
+// ---------------------------------------------------------------------------
+
+export type Permission =
+  | "browser_control"
+  | "app_control"
+  | "shell"
+  | "network"
+  | "filesystem";
+
+export interface PermissionGrant {
+  workspace_id: string;
+  agent_id: string;
+  permission: Permission;
+}
+
+export type ComputerActionKind =
+  | "navigate"
+  | "click"
+  | "type_text"
+  | "screenshot"
+  | "launch_app"
+  | "tap";
+
+export interface ComputerAction {
+  action: ComputerActionKind;
+  target: string;
+}
+
+export interface ComputerActionResult {
+  permitted: boolean;
+  executed: boolean;
+  message: string;
+}
