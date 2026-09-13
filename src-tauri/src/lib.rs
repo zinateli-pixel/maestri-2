@@ -12,6 +12,7 @@ mod process_manager;
 mod runtime;
 mod skills;
 mod state;
+mod web_agent;
 mod workflow;
 
 use state::AppState;
@@ -125,6 +126,7 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let state = app.state::<AppState>();
                 state.processes.stop_all();
+                state.web_sessions.stop_all();
             }
         });
 }

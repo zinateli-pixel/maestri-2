@@ -126,6 +126,7 @@ export interface CreateAgentInput {
   name: string;
   role: Role;
   runtime: Runtime;
+  kind?: AgentKind;
   model: string;
   command: string;
   args: string[];

@@ -13,7 +13,7 @@
 //! 4. Retry se configurado e falhou.
 //! 5. Cancela se flag global setada.
 
-use crate::models::{Agent, Status};
+use crate::models::{Agent, AgentKind, Status};
 use crate::process_manager::ProcessManager;
 use crate::runtime::{ProcessHandle, RuntimeError};
 use serde::{Deserialize, Serialize};
@@ -302,6 +302,16 @@ impl ProcessNodeExecutor {
 impl NodeExecutor for ProcessNodeExecutor {
     fn start(&self, app: Option<&AppHandle>, agent: &Agent) -> Result<Box<dyn ExitWatcher>, RuntimeError> {
         let app = app.expect("AppHandle necessário para ProcessNodeExecutor");
+
+        // Agentes web não executam via PTY; a execução em workflow exigirá o
+        // controle de navegador da Fase 16. Falha clara em vez de spawn errado.
+        if agent.kind == AgentKind::Web {
+            return Err(RuntimeError(format!(
+                "agente '{}' é do tipo Web — execução em workflow disponível na Fase 16",
+                agent.name
+            )));
+        }
+
         // Registra watcher ANTES de start para não perder o exit.
         let (tx, rx) = channel::<i32>();
         let output_buf = Arc::new(Mutex::new(Vec::<u8>::new()));

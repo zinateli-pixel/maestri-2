@@ -73,6 +73,9 @@ pub struct AppState {
     pub persistence: Persistence,
     pub processes: ProcessManager,
 
+    /// Sessões web ativas (Fase 14 — AgentKind::Web), isoladas por workspace.
+    pub web_sessions: crate::web_agent::WebSessionManager,
+
     /// Barramento interno de comunicação entre agentes.
     pub agent_bus: AgentBusState,
 
@@ -138,6 +141,7 @@ impl AppState {
             executions: Mutex::new(HashMap::new()),
             persistence,
             processes: ProcessManager::new(),
+            web_sessions: crate::web_agent::WebSessionManager::new(),
             agent_bus: AgentBusState::new(),
             delivered_ids: Mutex::new(HashSet::new()),
             protocol_ready: Mutex::new(HashSet::new()),
@@ -194,6 +198,7 @@ impl AppState {
     /// status "running" fantasma no JSON.
     pub fn stop_all_processes(&self) {
         self.processes.stop_all();
+        self.web_sessions.stop_all();
         let mut changed = false;
         {
             let mut guard = self.workspace.lock().expect("workspace mutex poisoned");

@@ -179,6 +179,7 @@ export function AgentDetailPanel({ agent, onClose }: AgentDetailPanelProps) {
           name: agent.name,
           role: agent.role,
           runtime: agent.runtime,
+          kind: agent.kind,
           model: agent.model,
           command: agent.command,
           args: agent.args,

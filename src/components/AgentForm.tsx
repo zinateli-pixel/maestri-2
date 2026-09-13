@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { CreateAgentInput, Role, Runtime } from "../types/models";
+import type { AgentKind, CreateAgentInput, Role, Runtime } from "../types/models";
 
 const ROLES: Role[] = [
   "orchestrator",
@@ -12,6 +12,8 @@ const ROLES: Role[] = [
 ];
 
 const RUNTIMES: Runtime[] = ["kilo", "claude_code", "opencode", "codex", "custom"];
+
+const KINDS: AgentKind[] = ["cli", "web", "app"];
 
 const ROLE_LABELS: Record<Role, string> = {
   orchestrator: "Orchestrator",
@@ -29,6 +31,12 @@ const RUNTIME_LABELS: Record<Runtime, string> = {
   opencode: "OpenCode",
   codex: "Codex",
   custom: "Custom",
+};
+
+const KIND_LABELS: Record<AgentKind, string> = {
+  cli: "CLI (terminal)",
+  web: "Web (navegador)",
+  app: "App (aplicativo)",
 };
 
 const RUNTIME_COMMANDS: Partial<Record<Runtime, string>> = {
@@ -58,6 +66,7 @@ export function AgentForm({
   const [runtime, setRuntime] = useState<Runtime>(
     initial?.runtime ?? "kilo"
   );
+  const [kind, setKind] = useState<AgentKind>(initial?.kind ?? "cli");
   const [model, setModel] = useState(initial?.model ?? "");
   const [command, setCommand] = useState(initial?.command ?? "");
   const [args, setArgs] = useState(initial?.args?.join(" ") ?? "");
@@ -81,6 +90,7 @@ export function AgentForm({
         name: name.trim(),
         role,
         runtime,
+        kind,
         model: model.trim(),
         command: command.trim(),
         args: args
@@ -124,6 +134,21 @@ export function AgentForm({
               {ROLES.map((r) => (
                 <option key={r} value={r}>
                   {ROLE_LABELS[r]}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field">
+            <span className="field-label">Tipo</span>
+            <select
+              className="field-select"
+              value={kind}
+              onChange={(e) => setKind(e.target.value as AgentKind)}
+            >
+              {KINDS.map((k) => (
+                <option key={k} value={k}>
+                  {KIND_LABELS[k]}
                 </option>
               ))}
             </select>

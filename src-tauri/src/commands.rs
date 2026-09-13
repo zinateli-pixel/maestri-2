@@ -38,6 +38,8 @@ pub struct CreateAgentInput {
     pub working_dir: String,
     #[serde(default)]
     pub auto_start: bool,
+    #[serde(default)]
+    pub kind: AgentKind,
 }
 
 /// Payload de atualização de agente (id obrigatório).
@@ -60,6 +62,8 @@ pub struct UpdateAgentInput {
     pub accent: Option<String>,
     #[serde(default)]
     pub auto_start: Option<bool>,
+    #[serde(default)]
+    pub kind: Option<AgentKind>,
 }
 
 /// Cria um agente, gera o id no backend, persiste e retorna o agente criado.
@@ -80,7 +84,7 @@ pub fn create_agent(
         name,
         role: input.role,
         runtime: input.runtime,
-        kind: AgentKind::Cli,
+        kind: input.kind,
         model: input.model,
         command: input.command,
         args: input.args,
@@ -137,6 +141,9 @@ pub fn update_agent(
     agent.command = input.command;
     agent.args = input.args;
     agent.working_dir = input.working_dir;
+    if let Some(kind) = input.kind {
+        agent.kind = kind;
+    }
     if let Some(collapsed) = input.collapsed {
         agent.collapsed = collapsed;
     }
@@ -318,6 +325,29 @@ pub fn restart_agent(
             .ok_or_else(|| "agente não encontrado".to_string())?
     };
 
+    // Agentes web reiniciam via sessão web (sem PTY).
+    if agent.kind == AgentKind::Web {
+        let _ = state.web_sessions.stop(&id);
+        let workspace_id = {
+            let guard = state
+                .workspace
+                .lock()
+                .expect("workspace mutex poisoned");
+            guard.metadata.id.clone()
+        };
+        set_status(&state, &id, Status::Starting)?;
+        return match state.web_sessions.start(&agent, &workspace_id) {
+            Ok(_) => {
+                set_status(&state, &id, Status::Running)?;
+                Ok(())
+            }
+            Err(e) => {
+                set_status(&state, &id, Status::Failed)?;
+                Err(e)
+            }
+        };
+    }
+
     if agent.runtime == Runtime::Custom && agent.command.trim().is_empty() {
         return Err("comando vazio — configure o comando do agente".to_string());
     }
@@ -358,6 +388,29 @@ pub fn refresh_agent(
             .ok_or_else(|| "agente não encontrado".to_string())?
     };
     eprintln!("[REFRESH] agent found: {} command={}", agent.name, agent.command);
+
+    // Agentes web atualizam via sessão web (stop + start), sem PTY.
+    if agent.kind == AgentKind::Web {
+        let _ = state.web_sessions.stop(&id);
+        let workspace_id = {
+            let guard = state
+                .workspace
+                .lock()
+                .expect("workspace mutex poisoned");
+            guard.metadata.id.clone()
+        };
+        set_status(&state, &id, Status::Starting)?;
+        return match state.web_sessions.start(&agent, &workspace_id) {
+            Ok(_) => {
+                set_status(&state, &id, Status::Running)?;
+                Ok(())
+            }
+            Err(e) => {
+                set_status(&state, &id, Status::Failed)?;
+                Err(e)
+            }
+        };
+    }
 
     if agent.command.trim().is_empty() {
         return Err("comando vazio — configure o comando do agente".to_string());
@@ -523,7 +576,7 @@ pub fn ping() -> String {
     "pong".to_string()
 }
 
-/// Inicia o processo real de um agente (Fase 3A: local shell via PTY).
+/// Inicia o processo real de um agente (CLI via PTY; Web via sessão web).
 #[tauri::command]
 pub fn start_agent(
     app: AppHandle,
@@ -543,6 +596,28 @@ pub fn start_agent(
             .cloned()
             .ok_or_else(|| "agente não encontrado".to_string())?
     };
+
+    // Agentes web têm ciclo de vida próprio (sem PTY/comando de CLI).
+    if agent.kind == AgentKind::Web {
+        set_status(&state, &id, Status::Starting)?;
+        let workspace_id = {
+            let guard = state
+                .workspace
+                .lock()
+                .expect("workspace mutex poisoned");
+            guard.metadata.id.clone()
+        };
+        return match state.web_sessions.start(&agent, &workspace_id) {
+            Ok(_) => {
+                set_status(&state, &id, Status::Running)?;
+                Ok(())
+            }
+            Err(e) => {
+                set_status(&state, &id, Status::Failed)?;
+                Err(e)
+            }
+        };
+    }
 
     if agent.command.trim().is_empty() {
         return Err("comando vazio — configure o comando do agente".to_string());
@@ -566,13 +641,32 @@ pub fn start_agent(
     }
 }
 
-/// Para o processo real de um agente.
+/// Para o processo real de um agente (CLI via PTY; Web via sessão web).
 #[tauri::command]
 pub fn stop_agent(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
+    let is_web = {
+        let guard = state
+            .workspace
+            .lock()
+            .expect("workspace mutex poisoned");
+        guard
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.kind == AgentKind::Web)
+            .unwrap_or(false)
+    };
+
+    if is_web {
+        state.web_sessions.stop(&id).map_err(|e| e.to_string())?;
+        set_status(&state, &id, Status::Stopped)?;
+        return Ok(());
+    }
+
     state
         .processes
         .stop(&app, &id)
@@ -595,13 +689,28 @@ pub fn send_agent_input(
         return Ok(());
     }
 
-    let workspace_id = {
+    let (workspace_id, is_web) = {
         let guard = state
             .workspace
             .lock()
             .expect("workspace mutex poisoned");
-        guard.metadata.id.clone()
+        let is_web = guard
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.kind == AgentKind::Web)
+            .unwrap_or(false);
+        (guard.metadata.id.clone(), is_web)
     };
+
+    // Agentes web recebem entrada na sessão web (sem PTY).
+    if is_web {
+        return state
+            .web_sessions
+            .send_input(&id, &input)
+            .map_err(|e| e.to_string());
+    }
+
     state
         .processes
         .send_input_in(&workspace_id, &id, &input)
