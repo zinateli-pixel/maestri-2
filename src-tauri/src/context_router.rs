@@ -877,8 +877,11 @@ const IDENTITY_HEADER: &str = "\
 const DIRECTIVE_HINTS: &str = "\
 [MESTRO] REQUIRED HANDSHAKE: use your shell tool now to run: \"$MAESTRO2_CLI\" agent-bridge ready\n\
 [MESTRO] To list peers, run with your shell tool: \"$MAESTRO2_CLI\" agent-bridge peers\n\
-[MESTRO] To send one-way, run: \"$MAESTRO2_CLI\" agent-bridge send \"<name_or_id>\" \"<message>\"\n\
+[MESTRO] If the human expects the peer to answer, confirm, or report back, you MUST use agent-bridge ask and wait for its correlated reply; never use send for a message that needs a response.\n\
+[MESTRO] Preserve the human's complete request in the ask payload, including any exact answer or response-format instruction; do not omit or paraphrase those constraints.\n\
+[MESTRO] Use agent-bridge send only for a one-way notification when no response is expected.\n\
 [MESTRO] To ask and receive a correlated reply, run: \"$MAESTRO2_CLI\" agent-bridge ask \"<name_or_id>\" \"<question>\"\n\
+[MESTRO] To send a one-way notification, run: \"$MAESTRO2_CLI\" agent-bridge send \"<name_or_id>\" \"<message>\"\n\
 [MESTRO] For an incoming request, run the exact agent-bridge reply command included in its envelope.\n\
 [MESTRO] Legacy stdout directives [[MESTRO:peers]], [[MESTRO:send ...]], [[MESTRO:ask ...]], and [[MESTRO:reply ...]] remain supported as fallback only.\n";
 
@@ -1485,6 +1488,9 @@ mod tests {
         // Identidade explícita do MAESTRO 2.0 e fonte de verdade = canvas.
         assert!(banner.contains("MAESTRO 2.0"));
         assert!(banner.contains("single source of truth"));
+        assert!(banner.contains("MUST use agent-bridge ask and wait for its correlated reply"));
+        assert!(banner.contains("Preserve the human's complete request in the ask payload"));
+        assert!(banner.contains("Use agent-bridge send only for a one-way notification when no response is expected"));
 
         // Proíbe explicitamente ferramentas externas de descoberta.
         assert!(banner.contains("maestri list"));
