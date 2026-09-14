@@ -16,6 +16,7 @@ mod process_manager;
 mod runtime;
 mod skills;
 mod state;
+mod templates;
 mod web_agent;
 mod workflow;
 
@@ -117,6 +118,11 @@ pub fn run() {
             history::list_history,
             history::history_by_agent,
             history::clear_history,
+            // Templates (Fase 19)
+            templates::list_templates,
+            templates::create_template,
+            templates::delete_template,
+            templates::apply_template,
             // Workspace management
             commands::list_workspaces,
             commands::create_workspace,

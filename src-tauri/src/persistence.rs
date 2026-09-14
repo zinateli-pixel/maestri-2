@@ -555,6 +555,35 @@ impl Persistence {
         }
     }
 
+    // ==================== TEMPLATES PERSISTENCE ====================
+
+    fn templates_path(&self) -> PathBuf {
+        self.app_data_dir.join("templates.json")
+    }
+
+    /// Carrega todos os templates. Arquivo ausente => lista vazia.
+    pub fn load_templates(&self) -> Result<Vec<crate::templates::AgentTemplate>, String> {
+        let path = self.templates_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| format!("falha ao ler templates: {e}"))?;
+        serde_json::from_str(&raw).map_err(|e| format!("falha ao desserializar templates: {e}"))
+    }
+
+    /// Grava a lista de templates de forma atômica (tmp -> rename).
+    pub fn save_templates(&self, templates: &[crate::templates::AgentTemplate]) -> Result<(), String> {
+        let path = self.templates_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("falha ao criar diretório de templates: {e}"))?;
+        }
+        let raw = serde_json::to_string_pretty(templates)
+            .map_err(|e| format!("falha ao serializar templates: {e}"))?;
+        let tmp = self.app_data_dir.join("templates.json.tmp");
+        fs::write(&tmp, raw).map_err(|e| format!("falha ao gravar templates: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("falha ao finalizar gravação de templates: {e}"))
+    }
+
     // ==================== PROJECT PERSISTENCE ====================
 
     fn projects_path(&self) -> PathBuf {

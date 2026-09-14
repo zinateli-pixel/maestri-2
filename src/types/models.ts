@@ -362,3 +362,34 @@ export interface HistoryEntry {
   data: string;
   timestamp: number;
 }
+
+// ---------------------------------------------------------------------------
+// Templates (Fase 19)
+// ---------------------------------------------------------------------------
+
+export interface AgentTemplate {
+  id: string;
+  name: string;
+  description: string;
+  role: Role;
+  runtime: Runtime;
+  kind: AgentKind;
+  model: string;
+  command: string;
+  args: string[];
+  working_dir: string;
+  auto_start: boolean;
+}
+
+export interface CreateTemplateInput {
+  name: string;
+  description?: string;
+  role: Role;
+  runtime: Runtime;
+  kind?: AgentKind;
+  model?: string;
+  command?: string;
+  args?: string[];
+  working_dir?: string;
+  auto_start?: boolean;
+}
