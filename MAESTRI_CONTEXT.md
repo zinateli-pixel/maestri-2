@@ -77,7 +77,7 @@ src-tauri/src/
 ## Build & teste
 - `pnpm build` — frontend (tsc + vite)
 - `cd src-tauri && cargo build` — backend dev
-- `cd src-tauri && cargo test` — 108 testes (persistência, modelos, PTY, routing, workflow, skills, MCP, memory, projects, discovery)
+- `cd src-tauri && cargo test` — 148 testes (persistência, modelos, PTY, routing, workflow, skills, MCP, memory, projects, discovery, codex, web/app agents, permissions, computer control, history, templates)
 - `pnpm tauri dev` — dev com hot reload
 - `pnpm tauri build` — release (.app + .dmg)
 
@@ -95,23 +95,36 @@ src-tauri/src/
 1..5 — Estabilizar Node/Terminal/PTY, modelo Agent, connections→contexto,
        comunicação agent↔agent, Agent Protocol: CONCLUÍDO (inclui hardening
        da Fase 4: banner de identidade "MAESTRO 2.0" + canvas como fonte de
-       verdade, proibição de maestri list/ask/OmniRoute e retry finito).
+       verdade, proibição de maestri list/ask/OmniRoute e retry finito, e
+       interceptação nativa de intenção de conexão "conecta A ao B").
 6..8  — Workflow Engine, eventos/estados, persistência local: CONCLUÍDO.
 9..10 — Skills (backend + UI) e MCP Manager (backend + UI): CONCLUÍDO.
 11    — Memory: CONCLUÍDO (backend + frontend: types, store e aba no painel).
 12    — Workspaces/Projects: CONCLUÍDO (backend + frontend: types, store e
        aba "Projects" no painel de capabilidades).
-13    — Runtime Adapters reais (Kilo, Claude Code, OpenCode) além do
-       LocalShellAdapter (Custom): CONCLUÍDO. Codex/Cline sem variante
-       dedicada — Cline roda via Custom com `command: "cline"`.
-14+   — Web/App Agents, Computer Control, Security, History, Templates,
-       Cloud/Supabase, Marketplace: PENDENTE.
+13    — Runtime Adapters reais (Kilo, Claude Code, OpenCode, Codex) além do
+       LocalShellAdapter (Custom): CONCLUÍDO.
+14    — Web Agents (AgentKind::Web): CONCLUÍDO. Fronteira de ciclo de vida
+       separada do CLI (WebSessionManager + StubWebAgentAdapter), isolamento
+       por workspace; driver de navegador fica para a Fase 16.
+15    — App Agents (AgentKind::App): CONCLUÍDO (AppSessionManager + stub,
+       espelhando a Fase 14).
+16    — Computer Control: CONTRATO implementado (catálogo de ações navigate/
+       click/type_text/screenshot/launch_app/tap gateado pela permissão, com
+       driver stub). O driver real (Playwright/XCTest/adb) é pendente.
+17    — Permissions/Security: CONCLUÍDO (deny por padrão, registro persistido
+       por workspace; PermissionRegistry + comandos grant/revoke/check).
+18    — History/Replay: CONCLUÍDO (histórico persistido de comunicação por
+       workspace, comandos list/history_by_agent/clear).
+19    — Templates: CONCLUÍDO (AgentTemplate persistido globalmente, list/
+       create/delete/apply_template).
+20..21 — Cloud/Supabase e Marketplace: BLOQUEADO pelo mandato LOCAL-FIRST
+       ("não migre para Supabase" — role AGENTS.md). Exige decisão do
+       usuário para seguir.
 
 ## Próxima fase (ordem real do roadmap)
-1. Runtime Adapter `Codex` (variante `Runtime::Codex` + `CodexAdapter`) —
-   extensão do item 13, seguindo o padrão do `OpenCodeAdapter`.
-2. Fase 14 — Web Agents (AgentKind::Web já existe; criar adapter web
-   separado dos CLI, lifecycle, RoutedMessage com workspace_id, integração
-   ao Workflow Engine, persistência/reload, isolamento e mock para testes).
-3. Fases 15+ — App Agents, Computer Control, Permissions/Security,
-   History/Replay, Templates, Cloud/Supabase, Marketplace.
+1. ⬜ Fase 16 (driver) — integrar um driver REAL de computer control
+   (browser/app) atrás do contrato + permissões já existentes.
+2. ⬜ Fase 14/15 — substituir os stubs Web/App por execução real.
+3. ⬜ Fase 20/21 — Cloud/Supabase e Marketplace (requer liberação do
+   mandato local-first pelo usuário).
