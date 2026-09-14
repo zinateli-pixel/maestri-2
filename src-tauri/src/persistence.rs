@@ -139,6 +139,7 @@ impl Persistence {
         self.delete_events(workspace_id);
         self.delete_memory_file(workspace_id);
         self.delete_permissions_file(workspace_id);
+        self.delete_history_file(workspace_id);
 
         Ok(())
     }
@@ -504,6 +505,51 @@ impl Persistence {
     /// Remove as permissões persistidas de um workspace.
     pub fn delete_permissions_file(&self, workspace_id: &str) {
         let path = self.permissions_path(workspace_id);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    // ==================== HISTORY PERSISTENCE ====================
+
+    fn history_dir(&self) -> PathBuf {
+        self.app_data_dir.join("history")
+    }
+
+    fn history_path(&self, workspace_id: &str) -> PathBuf {
+        self.history_dir().join(format!("{}.json", workspace_id))
+    }
+
+    /// Carrega o histórico persistido de um workspace.
+    pub fn load_history(&self, workspace_id: &str) -> Result<Vec<crate::history::HistoryEntry>, String> {
+        let path = self.history_path(workspace_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| format!("falha ao ler histórico: {e}"))?;
+        serde_json::from_str(&raw).map_err(|e| format!("falha ao desserializar histórico: {e}"))
+    }
+
+    /// Salva o histórico de um workspace com rename atômico.
+    pub fn save_history(
+        &self,
+        workspace_id: &str,
+        entries: &[crate::history::HistoryEntry],
+    ) -> Result<(), String> {
+        let dir = self.history_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("falha ao criar diretório de histórico: {e}"))?;
+        let raw = serde_json::to_string_pretty(entries)
+            .map_err(|e| format!("falha ao serializar histórico: {e}"))?;
+        let path = self.history_path(workspace_id);
+        let tmp = dir.join(format!("{}.tmp", workspace_id));
+        fs::write(&tmp, raw).map_err(|e| format!("falha ao gravar histórico: {e}"))?;
+        fs::rename(&tmp, &path)
+            .map_err(|e| format!("falha ao finalizar gravação de histórico: {e}"))
+    }
+
+    /// Remove o histórico persistido de um workspace.
+    pub fn delete_history_file(&self, workspace_id: &str) {
+        let path = self.history_path(workspace_id);
         if path.exists() {
             let _ = fs::remove_file(&path);
         }

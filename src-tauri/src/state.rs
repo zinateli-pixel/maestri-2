@@ -263,6 +263,12 @@ impl AppState {
         }
     }
 
+    /// Registra um evento de comunicação no histórico persistido (Fase 18).
+    /// Best-effort: falhas de disco não afetam a execução.
+    pub fn record_history(&self, workspace_id: &str, agent_id: &str, direction: &str, data: &str) {
+        crate::history::append(&self.persistence, workspace_id, agent_id, direction, data);
+    }
+
     /// Roteia um payload da origem para os destinos conectados (Fase 3).
     /// Resolve as edges de saída e delega a entrega ao transporte (CLI hoje).
     /// Também registra as entregas no barramento interno (Fase 4) para que o
@@ -294,6 +300,7 @@ impl AppState {
             data: payload.to_string(),
             timestamp: ts,
         });
+        self.record_history(&workspace_id, source_id, "out", payload);
         for report in &reports {
             if report.delivered {
                 self.agent_bus.push(AgentBusMessage {
@@ -341,6 +348,7 @@ impl AppState {
             data: payload.to_string(),
             timestamp: ts,
         });
+        self.record_history(&workspace_id, source_id, "out", payload);
         if report.delivered {
             self.agent_bus.push(AgentBusMessage {
                 workspace_id: workspace_id.clone(),
@@ -397,6 +405,7 @@ impl AppState {
             data: payload.to_string(),
             timestamp: now,
         });
+        self.record_history(&workspace_id, source_id, "ask_out", payload);
         if report.delivered {
             self.agent_bus.push(AgentBusMessage {
                 workspace_id: workspace_id.clone(),
@@ -446,6 +455,7 @@ impl AppState {
             data: payload.to_string(),
             timestamp: now,
         });
+        self.record_history(&workspace_id, source_id, "reply_out", payload);
         if report.delivered {
             self.agent_bus.push(AgentBusMessage {
                 workspace_id: workspace_id.clone(),

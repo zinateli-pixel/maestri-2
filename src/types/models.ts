@@ -349,3 +349,16 @@ export interface ComputerActionResult {
   executed: boolean;
   message: string;
 }
+
+// ---------------------------------------------------------------------------
+// History / Replay (Fase 18)
+// ---------------------------------------------------------------------------
+
+export interface HistoryEntry {
+  id: string;
+  workspace_id: string;
+  agent_id: string;
+  direction: string;
+  data: string;
+  timestamp: number;
+}

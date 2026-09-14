@@ -6,6 +6,7 @@ mod commands;
 mod computer_control;
 mod context_router;
 mod events;
+mod history;
 mod mcp;
 mod memory;
 mod models;
@@ -112,6 +113,10 @@ pub fn run() {
             permissions::check_permission,
             // Computer Control (Fase 16)
             computer_control::computer_action,
+            // History / Replay (Fase 18)
+            history::list_history,
+            history::history_by_agent,
+            history::clear_history,
             // Workspace management
             commands::list_workspaces,
             commands::create_workspace,
