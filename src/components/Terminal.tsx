@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { registerSink, unregisterSink } from "../terminal/terminalRegistry";
 import { useWorkspaceStore } from "../store/workspaceStore";
+import type { WorkspaceState } from "../types/models";
 import { createPortal } from "react-dom";
 
 interface TerminalProps {
@@ -103,9 +104,21 @@ export function Terminal({ agentId }: TerminalProps) {
     registerSink(agentId, sink);
 
     const dataDisposable = term.onData((data) => {
-      void invoke("send_agent_input", { id: agentId, input: data }).catch(
-        () => {}
-      );
+      void invoke<string | null>("send_agent_input", { id: agentId, input: data })
+        .then(async (connectionFeedback) => {
+          if (!connectionFeedback) return;
+
+          // A native connection intent mutates topology in Rust. Refresh only
+          // the edge list so the canvas reflects the Maestri-owned connection
+          // without clobbering local node geometry or other in-flight edits.
+          const latest = await invoke<WorkspaceState>("get_workspace_state");
+          const current = useWorkspaceStore.getState().state;
+          if (current?.metadata.id === latest.metadata.id) {
+            useWorkspaceStore.setState({ state: { ...current, edges: latest.edges } });
+          }
+          useWorkspaceStore.getState().pushToast(connectionFeedback, "success");
+        })
+        .catch(() => {});
     });
 
     // CRÍTICO: captura o wheel ANTES do React Flow (d3-zoom escuta no pane).

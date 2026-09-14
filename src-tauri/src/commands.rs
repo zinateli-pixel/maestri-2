@@ -1,5 +1,5 @@
 use crate::models::{Agent, AgentKind, Edge, EdgeType, Project, ProjectWorkspaceInput, CreateProjectInput, RenameProjectInput, Role, Runtime, Status, Viewport, WorkspaceListItem, WorkspaceSettings, WorkspaceState, WorkspaceMetadata, CreateWorkspaceInput, RenameWorkspaceInput, UpdateWorkspaceSettingsInput, UpdateViewportInput, validate_edge};
-use crate::state::AppState;
+use crate::state::{AppState, ConnectionInputChunk, ConnectionIntentResult};
 use crate::workflow::{WorkflowDefinition, WorkflowExecution};
 use serde::Deserialize;
 use tauri::{AppHandle, Manager, State};
@@ -688,13 +688,7 @@ pub fn send_agent_input(
     state: State<'_, AppState>,
     id: String,
     input: String,
-) -> Result<(), String> {
-    // Intercepta intenção de conexão nativa (ex.: "conecta Kilo 1 ao OpenCode 1")
-    // antes de enviar ao CLI. Se for intenção de conexão, resolve nativamente
-    // via bridge IPC da Fase 4 e não encaminha ao shell.
-    if let Some(_) = state.handle_connection_intent(&id, &input)? {
-        return Ok(());
-    }
+) -> Result<Option<String>, String> {
 
     let (workspace_id, kind) = {
         let guard = state
@@ -712,15 +706,37 @@ pub fn send_agent_input(
 
     // Agentes não-CLI (Web/App) recebem entrada na sessão própria (sem PTY).
     if kind != AgentKind::Cli {
-        return state
+        state
             .send_input_non_cli(&id, kind, &input)
-            .map_err(|e| e.to_string());
+            .map_err(|e| e.to_string())?;
+        return Ok(None);
     }
 
-    state
-        .processes
-        .send_input_in(&workspace_id, &id, &input)
-        .map_err(|e| e.to_string())
+    let mut feedback = None;
+    for chunk in state.buffer_connection_intent_input(&id, &input) {
+        match chunk {
+            ConnectionInputChunk::Text(text) => {
+                state.processes.send_input_in(&workspace_id, &id, &text)
+                    .map_err(|e| e.to_string())?;
+            }
+            ConnectionInputChunk::Intent(line) => {
+                match state.handle_connection_intent(&id, &line)? {
+                    Some(ConnectionIntentResult::Connected(peer_name)) => {
+                        feedback = Some(format!("Conexão nativa do Maestri confirmada com {peer_name}."));
+                    }
+                    Some(ConnectionIntentResult::UnknownPeer) => {
+                        feedback = Some("O Maestri não encontrou esse peer neste workspace; nenhum comando externo foi executado.".to_string());
+                    }
+                    None => {
+                        state.processes.send_input_in(&workspace_id, &id, &line)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(feedback)
 }
 
 /// Redimensiona o PTY de um agente.

@@ -58,6 +58,41 @@ impl Default for AgentBusState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionInputChunk {
+    Text(String),
+    Intent(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionIntentResult {
+    Connected(String),
+    UnknownPeer,
+}
+
+fn is_connection_intent_prefix(input: &str) -> bool {
+    let text = input.trim_start().to_lowercase();
+    if text.is_empty() {
+        return false;
+    }
+    [
+        "conecta ", "conectar ", "ligar ", "connect ", "link ",
+        "se conecte", "conecte-se", "conecte voce", "conecte você",
+        "quero me conectar", "quero conectar", "gostaria de me conectar",
+        "o ",
+    ]
+    .iter()
+    .any(|start| start.starts_with(&text) || text.starts_with(start))
+}
+
+fn normalize_agent_reference(reference: &str) -> String {
+    reference
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '.' | ',' | '!' | '?' | ':' | ';' | '"' | '\''))
+        .trim()
+        .to_lowercase()
+}
+
 /// Estado da aplicação em memória + persistência em JSON.
 /// O backend é a fonte da verdade: toda mutação passa por aqui
 /// e é gravada em disco imediatamente.
@@ -91,6 +126,10 @@ pub struct AppState {
     /// Handshakes confirmados pelo canal IPC (`workspace_id\0agent_id`).
     /// Controla o retry de discovery sem continuar injetando prompts no TUI.
     pub protocol_ready: Mutex<HashSet<String>>,
+
+    /// Linha candidata a intenção de conexão, acumulada por agente até Enter.
+    /// O terminal envia `send_agent_input` por evento de teclado, não por linha.
+    pub connection_intent_buffers: Mutex<HashMap<String, String>>,
 
     /// Pedidos (ask) pendentes aguardando resposta (correlação request/reply).
     pub pending_requests: RequestRegistry,
@@ -157,6 +196,7 @@ impl AppState {
             agent_bus: AgentBusState::new(),
             delivered_ids: Mutex::new(HashSet::new()),
             protocol_ready: Mutex::new(HashSet::new()),
+            connection_intent_buffers: Mutex::new(HashMap::new()),
             pending_requests: RequestRegistry::new(),
             workflow_events,
         }
@@ -510,6 +550,72 @@ impl AppState {
             .collect()
     }
 
+    /// Divide os eventos de teclado entre texto normal e linhas candidatas a
+    /// intenção de conexão. Só retém prefixos plausíveis; ao completar a linha,
+    /// o chamador tenta resolvê-la no workspace antes de encaminhá-la ao CLI.
+    pub fn buffer_connection_intent_input(
+        &self,
+        agent_id: &str,
+        input: &str,
+    ) -> Vec<ConnectionInputChunk> {
+        let workspace_id = self
+            .workspace
+            .lock()
+            .expect("workspace mutex poisoned")
+            .metadata
+            .id
+            .clone();
+        let key = format!("{workspace_id}\0{agent_id}");
+        let mut buffers = self
+            .connection_intent_buffers
+            .lock()
+            .expect("connection intent mutex poisoned");
+        let pending = buffers.entry(key.clone()).or_default();
+        let mut chunks = Vec::new();
+        let mut passthrough = String::new();
+
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\r' || ch == '\n' {
+                if !pending.is_empty() {
+                    if !passthrough.is_empty() {
+                        chunks.push(ConnectionInputChunk::Text(std::mem::take(&mut passthrough)));
+                    }
+                    let line = std::mem::take(pending);
+                    chunks.push(ConnectionInputChunk::Intent(format!("{line}{ch}")));
+                } else {
+                    passthrough.push(ch);
+                }
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                continue;
+            }
+
+            if pending.is_empty() {
+                let candidate = ch.to_string();
+                if is_connection_intent_prefix(&candidate) {
+                    pending.push(ch);
+                } else {
+                    passthrough.push(ch);
+                }
+            } else {
+                pending.push(ch);
+                if !is_connection_intent_prefix(pending) {
+                    passthrough.push_str(&std::mem::take(pending));
+                }
+            }
+        }
+
+        if !passthrough.is_empty() {
+            chunks.push(ConnectionInputChunk::Text(passthrough));
+        }
+        if pending.is_empty() {
+            buffers.remove(&key);
+        }
+        chunks
+    }
+
     /// Notifica um agente (se estiver em execução) com a lista atualizada de
     /// seus peers conectados. Usado na descoberta ao iniciar e ao criar/remover
     /// edges — a topologia do canvas é a fonte de verdade que chega ao agente.
@@ -538,22 +644,21 @@ impl AppState {
 
     /// Tenta interpretar e executar uma intenção de conexão nativa a partir
     /// da entrada do usuário (ex.: "conecta Kilo 1 ao OpenCode 1").
-    /// Retorna `Some(())` se a intenção foi reconhecida e tratada nativamente
-    /// (não deve ser encaminhada ao CLI), ou `None` se não for uma intenção
-    /// de conexão reconhecida (deve seguir fluxo normal para o CLI).
+    /// Retorna um resultado se a intenção foi reconhecida (não deve ser
+    /// encaminhada ao CLI), ou `None` se o input for conteúdo normal.
     pub fn handle_connection_intent(
         &self,
         source_agent_id: &str,
         input: &str,
-    ) -> Result<Option<()>, String> {
-        let trimmed = input.trim();
+    ) -> Result<Option<ConnectionIntentResult>, String> {
+        let trimmed = input.trim().trim_end_matches(['.', '!', '?']).trim();
         if trimmed.is_empty() {
             return Ok(None);
         }
 
         // Padrões de intenção de conexão, compilados uma única vez (evita
         // recompilar regex a cada tecla digitada no terminal).
-        static PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
+        static EXPLICIT_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
             std::sync::LazyLock::new(|| {
                 [
                     // pt-BR
@@ -569,19 +674,44 @@ impl AppState {
                 .collect()
             });
 
-        let (source_name, target_name) = match PATTERNS
+        static IMPLICIT_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
+            std::sync::LazyLock::new(|| {
+                [
+                    // Pedidos naturais com origem implícita = agente cujo terminal recebeu a frase.
+                    r"(?i)^(?:se conecte|conecte-se|conecte voce|conecte você|quero me conectar|quero conectar|gostaria de me conectar)\s+(?:ao|a|com)\s+(.+?)\s*[.!?]*$",
+                    // Declarações de contexto também significam usar/confirmar o peer do canvas.
+                    r"(?i)^(?:o\s+)?(.+?)\s+(?:está|esta|is)\s+(?:conectado|connected)\s+(?:a|ao|com|to|with)\s+(?:você|voce|you)(?:\s+.*)?$",
+                ]
+                .iter()
+                .filter_map(|pat| regex::Regex::new(pat).ok())
+                .collect()
+            });
+
+        let source_agent = {
+            let guard = self.workspace.lock().expect("workspace mutex poisoned");
+            guard.agents.iter().find(|a| a.id == source_agent_id).cloned()
+        };
+        let Some(source_agent) = source_agent else {
+            return Ok(None);
+        };
+
+        let explicit = EXPLICIT_PATTERNS
+            .iter()
+            .find_map(|re| re.captures(trimmed));
+        let (source_name, target_name) = if let Some(caps) = explicit {
+            let src = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+            let tgt = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            if src.is_empty() || tgt.is_empty() {
+                return Ok(None);
+            }
+            (Some(src.to_string()), tgt.to_string())
+        } else if let Some(caps) = IMPLICIT_PATTERNS
             .iter()
             .find_map(|re| re.captures(trimmed))
         {
-            Some(caps) => {
-                let src = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-                let tgt = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                if src.is_empty() || tgt.is_empty() {
-                    return Ok(None);
-                }
-                (src.to_string(), tgt.to_string())
-            }
-            None => return Ok(None),
+            (None, caps.get(1).unwrap().as_str().trim().to_string())
+        } else {
+            return Ok(None);
         };
 
         // Resolve nomes para IDs dos agentes no workspace atual
@@ -590,14 +720,9 @@ impl AppState {
             (guard.agents.clone(), guard.edges.clone())
         };
 
-        let source_agent = agents.iter().find(|a| a.id == source_agent_id);
-        let Some(source_agent) = source_agent else {
-            return Ok(None);
-        };
-
         // Resolve source_agent_id -> nome normalizado para comparação
         let source_name_normalized = source_agent.name.trim().to_lowercase();
-        let source_name_input = source_name.trim().to_lowercase();
+        let source_name_input = source_name.unwrap_or_else(|| source_agent.name.clone()).trim().to_lowercase();
 
         // O usuário pode referenciar o agente origem pelo nome ou "eu"/"me"/"this"
         let is_self_ref = source_name_input == "eu"
@@ -612,12 +737,20 @@ impl AppState {
         }
 
         // Resolve target pelo nome
-        let target_agent = agents.iter().find(|a| {
-            a.name.trim().to_lowercase() == target_name.trim().to_lowercase()
-        });
-        let Some(target_agent) = target_agent else {
-            // Agente alvo não encontrado - não intercepta, deixa ir para o CLI
-            return Ok(None);
+        let target_normalized = normalize_agent_reference(&target_name);
+        let target_matches = agents
+            .iter()
+            .filter(|agent| {
+                let name = normalize_agent_reference(&agent.name);
+                name == target_normalized
+                    || name.starts_with(&format!("{target_normalized} "))
+                    || target_normalized.starts_with(&format!("{name} "))
+            })
+            .collect::<Vec<_>>();
+        let Some(target_agent) = (target_matches.len() == 1).then(|| target_matches[0]) else {
+            // A frase era claramente uma intenção de conexão. Consuma-a mesmo
+            // sem resolução para que o agente nunca procure infraestrutura externa.
+            return Ok(Some(ConnectionIntentResult::UnknownPeer));
         };
 
         // Verifica se já existe edge entre source e target
@@ -649,7 +782,7 @@ impl AppState {
         self.announce_peers_to(&source_agent.id);
         self.announce_peers_to(&target_agent.id);
 
-        Ok(Some(()))
+        Ok(Some(ConnectionIntentResult::Connected(target_agent.name.clone())))
     }
 
     /// Verifica se uma mensagem (por id) já foi entregue nesta sessão
@@ -809,7 +942,7 @@ mod tests {
         let result = state
             .handle_connection_intent("agent-1", "conecta Kilo 1 ao OpenCode 1")
             .expect("no error");
-        assert_eq!(result, Some(()));
+        assert_eq!(result, Some(ConnectionIntentResult::Connected("OpenCode 1".into())));
 
         let guard = state.workspace.lock().expect("workspace mutex poisoned");
         assert_eq!(guard.edges.len(), 1);
@@ -823,7 +956,7 @@ mod tests {
         let result = state
             .handle_connection_intent("agent-1", "conecta eu ao OpenCode 1")
             .expect("no error");
-        assert_eq!(result, Some(()));
+        assert_eq!(result, Some(ConnectionIntentResult::Connected("OpenCode 1".into())));
 
         let guard = state.workspace.lock().expect("workspace mutex poisoned");
         assert_eq!(guard.edges.len(), 1);
@@ -855,12 +988,12 @@ mod tests {
     }
 
     #[test]
-    fn connection_intent_unknown_target_is_not_handled() {
+    fn connection_intent_unknown_target_is_consumed_without_external_discovery() {
         let state = test_state();
         let result = state
             .handle_connection_intent("agent-1", "conecta Kilo 1 ao Agent Fantasma")
             .expect("no error");
-        assert_eq!(result, None);
+        assert_eq!(result, Some(ConnectionIntentResult::UnknownPeer));
 
         let guard = state.workspace.lock().expect("workspace mutex poisoned");
         assert!(guard.edges.is_empty());
@@ -872,12 +1005,57 @@ mod tests {
         let result = state
             .handle_connection_intent("agent-1", "connect Kilo 1 to OpenCode 1")
             .expect("no error");
-        assert_eq!(result, Some(()));
+        assert_eq!(result, Some(ConnectionIntentResult::Connected("OpenCode 1".into())));
 
         let guard = state.workspace.lock().expect("workspace mutex poisoned");
         assert_eq!(guard.edges.len(), 1);
         assert_eq!(guard.edges[0].source, "agent-1");
         assert_eq!(guard.edges[0].target, "agent-2");
+    }
+
+    #[test]
+    fn natural_self_connection_phrasings_resolve_runtime_name() {
+        for phrase in [
+            "se conecte ao OpenCode",
+            "quero me conectar ao OpenCode",
+            "o OpenCode está conectado a você no canvas do Maestro 2",
+        ] {
+            let state = test_state();
+            let result = state
+                .handle_connection_intent("agent-1", phrase)
+                .expect("no error");
+            assert_eq!(result, Some(ConnectionIntentResult::Connected("OpenCode 1".into())), "{phrase}");
+            assert_eq!(state.workspace.lock().unwrap().edges.len(), 1, "{phrase}");
+        }
+    }
+
+    #[test]
+    fn unknown_peer_connection_intent_is_consumed_natively() {
+        let state = test_state();
+        assert_eq!(
+            state.handle_connection_intent("agent-1", "se conecte ao Pinokio").unwrap(),
+            Some(ConnectionIntentResult::UnknownPeer)
+        );
+        assert!(state.workspace.lock().unwrap().edges.is_empty());
+    }
+
+    #[test]
+    fn connection_intent_buffer_waits_for_enter_then_emits_whole_phrase() {
+        let state = test_state();
+        assert!(state.buffer_connection_intent_input("agent-1", "se conecte ao OpenCode").is_empty());
+        assert_eq!(
+            state.buffer_connection_intent_input("agent-1", "\r"),
+            vec![ConnectionInputChunk::Intent("se conecte ao OpenCode\r".into())]
+        );
+    }
+
+    #[test]
+    fn normal_input_is_not_swallowed_by_connection_intent_buffer() {
+        let state = test_state();
+        assert_eq!(
+            state.buffer_connection_intent_input("agent-1", "escreva um teste"),
+            vec![ConnectionInputChunk::Text("escreva um teste".into())]
+        );
     }
 }
 
