@@ -72,7 +72,19 @@ pub enum ConnectionIntentResult {
 }
 
 fn is_connection_intent_prefix(input: &str) -> bool {
-    let text = input.trim_start().to_lowercase();
+    const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+    const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+
+    // Enquanto o marcador inicial ainda chega fragmentado, retenha-o. Assim
+    // uma colagem de intenção não vaza o ESC[200~ isolado para o PTY.
+    if BRACKETED_PASTE_START.starts_with(input) {
+        return true;
+    }
+    let text = input
+        .replace(BRACKETED_PASTE_START, "")
+        .replace(BRACKETED_PASTE_END, "")
+        .trim_start()
+        .to_lowercase();
     if text.is_empty() {
         return false;
     }
@@ -80,6 +92,9 @@ fn is_connection_intent_prefix(input: &str) -> bool {
         "conecta ", "conectar ", "ligar ", "connect ", "link ",
         "se conecte", "conecte-se", "conecte voce", "conecte você",
         "quero me conectar", "quero conectar", "gostaria de me conectar",
+        "quero que voce", "quero que você",
+        "voce esta no maestro", "voce está no maestro",
+        "você esta no maestro", "você está no maestro",
         "o ",
     ]
     .iter()
@@ -650,7 +665,13 @@ impl AppState {
         source_agent_id: &str,
         input: &str,
     ) -> Result<Option<ConnectionIntentResult>, String> {
-        let trimmed = input.trim().trim_end_matches(['.', '!', '?']).trim();
+        // xterm envolve colagens em bracketed-paste quando o TUI solicita esse
+        // modo. Esses bytes são transporte de terminal, não parte do nome do
+        // peer, e devem ser ignorados somente durante o parsing nativo.
+        let sanitized = input
+            .replace("\u{1b}[200~", "")
+            .replace("\u{1b}[201~", "");
+        let trimmed = sanitized.trim().trim_end_matches(['.', '!', '?']).trim();
         if trimmed.is_empty() {
             return Ok(None);
         }
@@ -676,6 +697,10 @@ impl AppState {
         static IMPLICIT_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
             std::sync::LazyLock::new(|| {
                 [
+                    // O usuário pode contextualizar a solicitação antes de pedir a
+                    // conexão. O preâmbulo continua sendo intenção nativa e nunca
+                    // deve chegar ao modelo/PTY como uma mensagem comum.
+                    r"(?i)^(?:(?:você|voce)\s+(?:está|esta)\s+no\s+maestro(?:\s*2(?:\.0)?)?\s*[.,;:!?-]*\s*)?(?:(?:eu\s+)?quero\s+que\s+(?:você|voce)\s+)?(?:se\s+conecte|conecte-se|conecte\s+(?:você|voce))\s+(?:ao|a|com)\s+(.+?)(?:\s+que\s+(?:está|esta)\s+conectad[oa]\s+(?:aqui|no\s+(?:canvas|maestro)(?:\s*2(?:\.0)?)?))?$",
                     // Pedidos naturais com origem implícita = agente cujo terminal recebeu a frase.
                     r"(?i)^(?:se conecte|conecte-se|conecte voce|conecte você|quero me conectar|quero conectar|gostaria de me conectar)\s+(?:ao|a|com)\s+(.+?)\s*[.!?]*$",
                     // Declarações de contexto também significam usar/confirmar o peer do canvas.
@@ -1016,6 +1041,9 @@ mod tests {
         for phrase in [
             "se conecte ao OpenCode",
             "quero me conectar ao OpenCode",
+            "quero que você se conecte ao OpenCode",
+            "Você está no Maestro 2. Quero que você se conecte ao OpenCode que está conectado aqui.",
+            "Voce esta no Maestro 2. Quero que voce se conecte ao OpenCode que esta conectado aqui.",
             "o OpenCode está conectado a você no canvas do Maestro 2",
         ] {
             let state = test_state();
@@ -1048,12 +1076,73 @@ mod tests {
     }
 
     #[test]
+    fn maestro_preamble_connection_intent_is_buffered_across_fragmented_input() {
+        let state = test_state();
+        let phrase = "Você está no Maestro 2. Quero que você se conecte ao OpenCode que está conectado aqui.";
+
+        for ch in phrase.chars() {
+            assert!(
+                state
+                    .buffer_connection_intent_input("agent-1", &ch.to_string())
+                    .is_empty(),
+                "fragmento foi liberado ao PTY: {ch:?}"
+            );
+        }
+
+        let chunks = state.buffer_connection_intent_input("agent-1", "\r");
+        assert_eq!(
+            chunks,
+            vec![ConnectionInputChunk::Intent(format!("{phrase}\r"))]
+        );
+        let ConnectionInputChunk::Intent(line) = &chunks[0] else {
+            panic!("a linha completa deveria ser classificada como intenção");
+        };
+        assert_eq!(
+            state.handle_connection_intent("agent-1", line).unwrap(),
+            Some(ConnectionIntentResult::Connected("OpenCode 1".into()))
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_markers_do_not_leak_into_peer_resolution() {
+        let state = test_state();
+        let phrase = "Você está no Maestro 2. Quero que você se conecte ao OpenCode que está conectado aqui.";
+        let pasted = format!("\u{1b}[200~{phrase}\u{1b}[201~\r");
+        let chunks = state.buffer_connection_intent_input("agent-1", &pasted);
+
+        assert_eq!(chunks.len(), 1, "marcadores não devem vazar como texto PTY");
+        let ConnectionInputChunk::Intent(line) = &chunks[0] else {
+            panic!("colagem deveria ser classificada como intenção");
+        };
+        assert_eq!(
+            state.handle_connection_intent("agent-1", line).unwrap(),
+            Some(ConnectionIntentResult::Connected("OpenCode 1".into()))
+        );
+    }
+
+    #[test]
     fn normal_input_is_not_swallowed_by_connection_intent_buffer() {
         let state = test_state();
         assert_eq!(
             state.buffer_connection_intent_input("agent-1", "escreva um teste"),
             vec![ConnectionInputChunk::Text("escreva um teste".into())]
         );
+    }
+
+    #[test]
+    fn normal_input_starting_with_voce_is_not_swallowed() {
+        let state = test_state();
+        let input = "Você pode revisar este arquivo?\r";
+        let output = state.buffer_connection_intent_input("agent-1", input);
+        assert!(output.iter().all(|chunk| matches!(chunk, ConnectionInputChunk::Text(_))));
+        let reconstructed = output
+            .into_iter()
+            .map(|chunk| match chunk {
+                ConnectionInputChunk::Text(text) => text,
+                ConnectionInputChunk::Intent(_) => unreachable!(),
+            })
+            .collect::<String>();
+        assert_eq!(reconstructed, input);
     }
 }
 

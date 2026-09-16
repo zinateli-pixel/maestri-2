@@ -103,9 +103,18 @@ export function Terminal({ agentId }: TerminalProps) {
     };
     registerSink(agentId, sink);
 
+    // xterm emite texto colado e Enter em eventos separados. Invokes Tauri
+    // concorrentes podem chegar ao Rust fora de ordem, fazendo o CR ultrapassar
+    // o texto e quebrar o buffer de intenção. A fila preserva exatamente a
+    // ordem observada no terminal para texto normal e intenções nativas.
+    let inputQueue: Promise<void> = Promise.resolve();
     const dataDisposable = term.onData((data) => {
-      void invoke<string | null>("send_agent_input", { id: agentId, input: data })
-        .then(async (connectionFeedback) => {
+      inputQueue = inputQueue
+        .then(async () => {
+          const connectionFeedback = await invoke<string | null>("send_agent_input", {
+            id: agentId,
+            input: data,
+          });
           if (!connectionFeedback) return;
 
           // A native connection intent mutates topology in Rust. Refresh only
@@ -118,6 +127,8 @@ export function Terminal({ agentId }: TerminalProps) {
           }
           useWorkspaceStore.getState().pushToast(connectionFeedback, "success");
         })
+        // Um erro de input não pode inutilizar permanentemente a fila: o
+        // próximo evento ainda precisa ser entregue ao processo.
         .catch(() => {});
     });
 

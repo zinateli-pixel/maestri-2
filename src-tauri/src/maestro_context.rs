@@ -55,8 +55,10 @@ Never discover Maestro or peers through filesystem searches, process inspection,
 Use only the private agent-bridge exposed by MAESTRO2_CLI and MAESTRO2_SOCKET. Available capabilities are connection/handshake, peers, send, ask, and reply.\n\
 To confirm the private handshake, run: \"$MAESTRO2_CLI\" agent-bridge ready\n\
 Before addressing a peer after topology may have changed, run: \"$MAESTRO2_CLI\" agent-bridge peers\n\
-Use ask when any answer, confirmation, result, or report is expected. Preserve the user's complete request in the ask payload and wait for the correlated reply.\n\
-Use send only for a one-way notification for which no response is expected.\n\
+Use ask when any answer, confirmation, result, or report is expected. Exact syntax: \"$MAESTRO2_CLI\" agent-bridge ask \"<peer name or agent_id>\" \"<complete request payload>\"\n\
+Preserve the user's complete request in the ask payload and wait for the correlated reply.\n\
+Use send only for a one-way notification for which no response is expected. Exact syntax: \"$MAESTRO2_CLI\" agent-bridge send \"<peer name or agent_id>\" \"<payload>\"\n\
+The bridge arguments are positional. Never invent flags such as --peer, --target, or --message.\n\
 For an incoming request, use the exact reply command in its envelope; preserve request_id/correlation and workspace.\n\
 Do not type agent-bridge commands as chat text: execute them with the runtime's shell tool.\n\
 \n\
@@ -187,7 +189,10 @@ mod tests {
         assert!(context.contains("filesystem searches"));
         assert!(context.contains("Pinokio"));
         assert!(context.contains("Use ask when"));
+        assert!(context.contains("agent-bridge ask \"<peer name or agent_id>\""));
         assert!(context.contains("Use send only"));
+        assert!(context.contains("arguments are positional"));
+        assert!(context.contains("Never invent flags such as --peer"));
         assert!(context.contains("preserve request_id/correlation and workspace"));
     }
 
