@@ -68,6 +68,7 @@ pub enum ConnectionInputChunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionIntentResult {
     Connected(String),
+    ConnectedAndSend { peer_name: String, payload: String },
     UnknownPeer,
 }
 
@@ -95,6 +96,8 @@ fn is_connection_intent_prefix(input: &str) -> bool {
         "quero que voce", "quero que você",
         "voce esta no maestro", "voce está no maestro",
         "você esta no maestro", "você está no maestro",
+        "voce esta no canvas", "voce está no canvas",
+        "você esta no canvas", "você está no canvas",
         "o ",
     ]
     .iter()
@@ -711,6 +714,14 @@ impl AppState {
                 .collect()
             });
 
+        static COMPOUND_CONNECT_SEND: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| {
+                regex::Regex::new(
+                    r"(?i)^(?:você|voce)\s+(?:está|esta)\s+no\s+canvas\s+do\s+maestr[io]\s*2(?:\.0)?\s+com\s+(?:o|a)\s+(.+?)\s+(?:nesse|neste)\s+workspace\s*[,;:.-]*\s*(?:se\s+conecte|conecte-se)\s+a\s+(?:ele|ela)\s+e\s+(?:mande|envie)\s+(?:(?:um|uma)\s+)?(.+)$",
+                )
+                .expect("compound connection regex must compile")
+            });
+
         let source_agent = {
             let guard = self.workspace.lock().expect("workspace mutex poisoned");
             guard.agents.iter().find(|a| a.id == source_agent_id).cloned()
@@ -719,21 +730,29 @@ impl AppState {
             return Ok(None);
         };
 
+        let compound = COMPOUND_CONNECT_SEND.captures(trimmed);
         let explicit = EXPLICIT_PATTERNS
             .iter()
             .find_map(|re| re.captures(trimmed));
-        let (source_name, target_name) = if let Some(caps) = explicit {
+        let (source_name, target_name, follow_up_payload) = if let Some(caps) = compound {
+            let target = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+            let payload = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            if target.is_empty() || payload.is_empty() {
+                return Ok(None);
+            }
+            (None, target.to_string(), Some(payload.to_string()))
+        } else if let Some(caps) = explicit {
             let src = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
             let tgt = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
             if src.is_empty() || tgt.is_empty() {
                 return Ok(None);
             }
-            (Some(src.to_string()), tgt.to_string())
+            (Some(src.to_string()), tgt.to_string(), None)
         } else if let Some(caps) = IMPLICIT_PATTERNS
             .iter()
             .find_map(|re| re.captures(trimmed))
         {
-            (None, caps.get(1).unwrap().as_str().trim().to_string())
+            (None, caps.get(1).unwrap().as_str().trim().to_string(), None)
         } else {
             return Ok(None);
         };
@@ -805,7 +824,13 @@ impl AppState {
         self.announce_peers_to(&source_agent.id);
         self.announce_peers_to(&target_agent.id);
 
-        Ok(Some(ConnectionIntentResult::Connected(target_agent.name.clone())))
+        Ok(Some(match follow_up_payload {
+            Some(payload) => ConnectionIntentResult::ConnectedAndSend {
+                peer_name: target_agent.name.clone(),
+                payload,
+            },
+            None => ConnectionIntentResult::Connected(target_agent.name.clone()),
+        }))
     }
 
     /// Verifica se uma mensagem (por id) já foi entregue nesta sessão
@@ -1118,6 +1143,33 @@ mod tests {
             state.handle_connection_intent("agent-1", line).unwrap(),
             Some(ConnectionIntentResult::Connected("OpenCode 1".into()))
         );
+    }
+
+    #[test]
+    fn canvas_compound_intent_connects_and_extracts_one_way_message() {
+        let state = test_state();
+        let phrase = "voce esta no canvas do maestri 2 com o opencode nesse workspace, se conecte a ele e mande um oi";
+
+        for ch in phrase.chars() {
+            assert!(
+                state
+                    .buffer_connection_intent_input("agent-1", &ch.to_string())
+                    .is_empty(),
+                "fragmento foi liberado ao PTY: {ch:?}"
+            );
+        }
+        let chunks = state.buffer_connection_intent_input("agent-1", "\r");
+        let ConnectionInputChunk::Intent(line) = &chunks[0] else {
+            panic!("a frase composta deveria ser uma intenção nativa");
+        };
+        assert_eq!(
+            state.handle_connection_intent("agent-1", line).unwrap(),
+            Some(ConnectionIntentResult::ConnectedAndSend {
+                peer_name: "OpenCode 1".into(),
+                payload: "oi".into(),
+            })
+        );
+        assert_eq!(state.workspace.lock().unwrap().edges.len(), 1);
     }
 
     #[test]

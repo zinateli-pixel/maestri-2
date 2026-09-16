@@ -3,8 +3,16 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("agent-bridge") {
-        if let Err(error) = tauri_app_lib::agent_bridge::run_client(&args[2..]) {
+    let bridge_args = match args.get(1).map(String::as_str) {
+        Some("agent-bridge") => Some(args[2..].to_vec()),
+        // Compatibilidade mínima com a skill global `maestri`. Não cria outro
+        // protocolo: apenas traduz os comandos para o agent-bridge existente.
+        Some("list") => Some(vec!["peers".to_string()]),
+        Some("ask") | Some("send") => Some(args[1..].to_vec()),
+        _ => None,
+    };
+    if let Some(bridge_args) = bridge_args {
+        if let Err(error) = tauri_app_lib::agent_bridge::run_client(&bridge_args) {
             eprintln!("{error}");
             std::process::exit(1);
         }

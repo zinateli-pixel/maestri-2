@@ -149,14 +149,15 @@ impl ProcessManager {
         };
         #[cfg(unix)]
         let bridge_env = if let Some(bridge) = bridge.as_ref() {
+            let bridge_cli = std::env::current_exe()
+                .map_err(|e| RuntimeError(e.to_string()))?
+                .to_string_lossy()
+                .to_string();
             vec![
-                (
-                    "MAESTRO2_CLI".to_string(),
-                    std::env::current_exe()
-                        .map_err(|e| RuntimeError(e.to_string()))?
-                        .to_string_lossy()
-                        .to_string(),
-                ),
+                ("MAESTRO2_CLI".to_string(), bridge_cli.clone()),
+                // Compatibilidade com a skill global `maestri`: ambos apontam
+                // para o mesmo cliente privado e o mesmo Unix socket.
+                ("MAESTRI_CLI".to_string(), bridge_cli),
                 (
                     "MAESTRO2_SOCKET".to_string(),
                     bridge.socket_path().to_string_lossy().to_string(),

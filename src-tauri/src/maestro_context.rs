@@ -53,6 +53,7 @@ runtime={runtime}\n\
 The Maestro canvas/workspace is the single source of truth for agent identity, peers, and connections.\n\
 Never discover Maestro or peers through filesystem searches, process inspection, PATH probing, network scans, Pinokio, pterm, Maestri/OmniRoute, or external apps.\n\
 Use only the private agent-bridge exposed by MAESTRO2_CLI and MAESTRO2_SOCKET. Available capabilities are connection/handshake, peers, send, ask, and reply.\n\
+MAESTRI_CLI is a compatibility alias for this same private bridge. If a Maestri skill is loaded, use MAESTRI_CLI directly; never search PATH, applications, or the filesystem for another CLI.\n\
 To confirm the private handshake, run: \"$MAESTRO2_CLI\" agent-bridge ready\n\
 Before addressing a peer after topology may have changed, run: \"$MAESTRO2_CLI\" agent-bridge peers\n\
 Use ask when any answer, confirmation, result, or report is expected. Exact syntax: \"$MAESTRO2_CLI\" agent-bridge ask \"<peer name or agent_id>\" \"<complete request payload>\"\n\
@@ -188,6 +189,7 @@ mod tests {
         assert!(context.contains("single source of truth"));
         assert!(context.contains("filesystem searches"));
         assert!(context.contains("Pinokio"));
+        assert!(context.contains("MAESTRI_CLI is a compatibility alias"));
         assert!(context.contains("Use ask when"));
         assert!(context.contains("agent-bridge ask \"<peer name or agent_id>\""));
         assert!(context.contains("Use send only"));

@@ -685,6 +685,7 @@ pub fn stop_agent(
 /// Envia input (stdin) ao processo de um agente.
 #[tauri::command]
 pub fn send_agent_input(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     input: String,
@@ -723,6 +724,17 @@ pub fn send_agent_input(
                 match state.handle_connection_intent(&id, &line)? {
                     Some(ConnectionIntentResult::Connected(peer_name)) => {
                         feedback = Some(format!("Conexão nativa do Maestri confirmada com {peer_name}."));
+                    }
+                    Some(ConnectionIntentResult::ConnectedAndSend { peer_name, payload }) => {
+                        let report = state.route_context_to_peer(&app, &id, &peer_name, &payload);
+                        feedback = Some(if report.delivered {
+                            format!("Conexão nativa do Maestri confirmada com {peer_name}; mensagem enviada: {payload}")
+                        } else {
+                            format!(
+                                "Conexão nativa do Maestri confirmada com {peer_name}, mas a mensagem não foi entregue: {}",
+                                report.error.unwrap_or_else(|| "destino indisponível".to_string())
+                            )
+                        });
                     }
                     Some(ConnectionIntentResult::UnknownPeer) => {
                         feedback = Some("O Maestri não encontrou esse peer neste workspace; nenhum comando externo foi executado.".to_string());
