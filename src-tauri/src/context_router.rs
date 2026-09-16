@@ -862,58 +862,6 @@ pub fn resolve_peer_id(
     None
 }
 
-/// Cabeçalho de identidade injetado em TODO agente CLI ao iniciar, mesmo sem
-/// peers conectados. Deixa explícito que o processo roda DENTRO do MAESTRO 2.0,
-/// que o canvas é a única fonte de verdade e que NÃO deve depender do Maestri
-/// original, `maestri list`, `maestri ask`, OmniRoute nem de descoberta externa.
-const IDENTITY_HEADER: &str = "\
-[MESTRO] You are running inside MAESTRO 2.0, a visual multi-agent orchestration platform. The canvas is the single source of truth for this environment.\n\
-[MESTRO] Do NOT use `maestri list`, `maestri ask`, OmniRoute, or any filesystem/process/network lookup to discover other agents. Those tools are not part of MAESTRO 2.0.\n\
-[MESTRO] Communicate only through the internal protocol directives below (they are MAESTRO 2.0 directives, not shell commands).\n";
-
-/// Diretivas de protocolo reafirmadas no banner. Escritas de modo que a
-/// diretiva nunca apareça no INÍCIO de uma linha (evita que o scanner
-/// interprete o eco do banner como uma diretiva real de send/list).
-const DIRECTIVE_HINTS: &str = "\
-[MESTRO] REQUIRED HANDSHAKE: use your shell tool now to run: \"$MAESTRO2_CLI\" agent-bridge ready\n\
-[MESTRO] To list peers, run with your shell tool: \"$MAESTRO2_CLI\" agent-bridge peers\n\
-[MESTRO] If the human expects the peer to answer, confirm, or report back, you MUST use agent-bridge ask and wait for its correlated reply; never use send for a message that needs a response.\n\
-[MESTRO] Preserve the human's complete request in the ask payload, including any exact answer or response-format instruction; do not omit or paraphrase those constraints.\n\
-[MESTRO] Use agent-bridge send only for a one-way notification when no response is expected.\n\
-[MESTRO] To ask and receive a correlated reply, run: \"$MAESTRO2_CLI\" agent-bridge ask \"<name_or_id>\" \"<question>\"\n\
-[MESTRO] To send a one-way notification, run: \"$MAESTRO2_CLI\" agent-bridge send \"<name_or_id>\" \"<message>\"\n\
-[MESTRO] For an incoming request, run the exact agent-bridge reply command included in its envelope.\n\
-[MESTRO] Legacy stdout directives [[MESTRO:peers]], [[MESTRO:send ...]], [[MESTRO:ask ...]], and [[MESTRO:reply ...]] remain supported as fallback only.\n";
-
-/// Constrói a mensagem de descoberta (banner/notícia de identidade) para o
-/// agente `source_id`. SEMPRE retorna conteúdo: identidade do MAESTRO 2.0 +
-/// diretivas do protocolo + a lista de peers conectados (ou "none"). Redigida
-/// como instrução imperativa para o modelo seguir, impedindo que ele procure
-/// peers no filesystem/processos/rede ou em CLIs externas como o Maestri.
-pub fn build_peers_banner(agents: &[Agent], edges: &[Edge], source_id: &str) -> String {
-    let mut peers = Vec::new();
-    for target_id in connected_peer_ids(edges, source_id) {
-        if let Some(a) = agents.iter().find(|x| x.id == target_id) {
-            peers.push(format!("{} (id={})", a.name, a.id));
-        }
-    }
-
-    let peers_line = if peers.is_empty() {
-        "[MESTRO] Connected peers: none.\n".to_string()
-    } else {
-        format!("[MESTRO] Connected peers: {}.\n", peers.join("; "))
-    };
-
-    format!("{}{}{}", IDENTITY_HEADER, DIRECTIVE_HINTS, peers_line)
-}
-
-/// Converte texto em uma submissão para TUI em PTY raw. Nesses runtimes,
-/// carriage return (`\r`) representa Enter; `\n` sozinho pode apenas deixar
-/// o texto no editor sem enviá-lo ao modelo.
-pub fn pty_submission(text: &str) -> String {
-    format!("{}\r", text.trim_end_matches(['\r', '\n']))
-}
-
 /// O Agent Protocol é uma conversa com um agente, não texto de inicialização
 /// para um shell genérico. Runtimes conhecidos sempre suportam o protocolo;
 /// no runtime Custom, limita a injeção a CLIs de agentes conhecidas.
@@ -1148,11 +1096,6 @@ mod tests {
     fn envelope_is_explicit_and_enter_terminated() {
         let m = RoutedMessage::new("ws1", "a1", "a2", MessageKind::Context, "alô", 123);
         assert_eq!(m.envelope(), "[context a1 -> a2] alô\r");
-    }
-
-    #[test]
-    fn pty_submission_uses_carriage_return_as_enter() {
-        assert_eq!(pty_submission("line 1\nline 2\n"), "line 1\nline 2\r");
     }
 
     #[test]
@@ -1437,86 +1380,6 @@ mod tests {
         let agents = vec![a, b];
         let edges = vec![sample_edge("a1", "a2")];
         assert_eq!(resolve_peer_id(&agents, &edges, "a1", "ghost"), None);
-    }
-
-    #[test]
-    fn build_peers_banner_lists_connected_peers() {
-        let a = cli_agent_named("a1", "OpenCode");
-        let b = cli_agent_named("a2", "Cline");
-        let agents = vec![a, b];
-        let edges = vec![sample_edge("a1", "a2")];
-        let banner = build_peers_banner(&agents, &edges, "a1");
-        assert!(banner.contains("Cline"));
-        assert!(banner.contains("id=a2"));
-        assert!(banner.contains("[[MESTRO:send"));
-    }
-
-    #[test]
-    fn build_peers_banner_sees_reverse_direction() {
-        let a = cli_agent_named("a1", "OpenCode");
-        let b = cli_agent_named("a2", "Cline");
-        let agents = vec![a, b];
-        let edges = vec![sample_edge("a1", "a2")];
-        // Mesmo sendo o target da edge, a2 vê a1 (e vice-versa é coberto acima).
-        let banner = build_peers_banner(&agents, &edges, "a2");
-        assert!(banner.contains("OpenCode"));
-        assert!(banner.contains("id=a1"));
-    }
-
-    #[test]
-    fn build_peers_banner_identity_without_edges() {
-        let a = cli_agent_named("a1", "OpenCode");
-        let b = cli_agent_named("a2", "Cline");
-        let agents = vec![a, b];
-        let edges: Vec<Edge> = vec![];
-        // Sem edges, ainda anuncia a identidade do MAESTRO 2.0 (nunca vazio),
-        // para que o agente saiba onde está mesmo sem peers conectados.
-        let banner = build_peers_banner(&agents, &edges, "a1");
-        assert!(!banner.is_empty());
-        assert!(banner.contains("MAESTRO 2.0"));
-        assert!(banner.contains("Connected peers: none"));
-    }
-
-    #[test]
-    fn banner_identifies_maestro2_canvas_and_forbids_external_discovery() {
-        let a = cli_agent_named("a1", "OpenCode");
-        let b = cli_agent_named("a2", "Cline");
-        let agents = vec![a, b];
-        let edges = vec![sample_edge("a1", "a2")];
-        let banner = build_peers_banner(&agents, &edges, "a1");
-
-        // Identidade explícita do MAESTRO 2.0 e fonte de verdade = canvas.
-        assert!(banner.contains("MAESTRO 2.0"));
-        assert!(banner.contains("single source of truth"));
-        assert!(banner.contains("MUST use agent-bridge ask and wait for its correlated reply"));
-        assert!(banner.contains("Preserve the human's complete request in the ask payload"));
-        assert!(banner.contains("Use agent-bridge send only for a one-way notification when no response is expected"));
-
-        // Proíbe explicitamente ferramentas externas de descoberta.
-        assert!(banner.contains("maestri list"));
-        assert!(banner.contains("maestri ask"));
-        assert!(banner.contains("OmniRoute"));
-
-        // Peers e protocolo interno presentes.
-        assert!(banner.contains("Cline"));
-        assert!(banner.contains("[[MESTRO:peers]]"));
-        assert!(banner.contains("[[MESTRO:send"));
-    }
-
-    #[test]
-    fn banner_echo_does_not_trigger_directives() {
-        let a = cli_agent_named("a1", "OpenCode");
-        let b = cli_agent_named("a2", "Cline");
-        let agents = vec![a, b];
-        let edges = vec![sample_edge("a1", "a2")];
-        let banner = build_peers_banner(&agents, &edges, "a1");
-
-        // Se o agente ecoar o banner de volta, o scanner NÃO deve interpretar
-        // nenhuma linha como diretiva de send/list (sem loop, sem eco em cascata).
-        let mut sc = ProtocolScanner::new();
-        let res = sc.feed(&banner);
-        assert!(res.directives.is_empty());
-        assert!(!res.forward.is_empty());
     }
 
     #[test]

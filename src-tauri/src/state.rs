@@ -1,5 +1,6 @@
 use crate::models::{Agent, AgentKind, Edge, EdgeType, Role, Runtime, Status, Viewport, WorkspaceListItem, WorkspaceSettings, WorkspaceState};
-use crate::context_router::{build_peers_banner, pty_submission, supports_agent_protocol, AskReport, CliContextTransport, ContextRouter, DeliveryReport, RequestRegistry};
+use crate::context_router::{supports_agent_protocol, AskReport, CliContextTransport, ContextRouter, DeliveryReport, RequestRegistry};
+use crate::maestro_context::build_maestro_context;
 use crate::events::{WorkflowEvent, WorkflowEventLog};
 use crate::persistence::Persistence;
 use crate::process_manager::ProcessManager;
@@ -616,11 +617,10 @@ impl AppState {
         chunks
     }
 
-    /// Notifica um agente (se estiver em execução) com a lista atualizada de
-    /// seus peers conectados. Usado na descoberta ao iniciar e ao criar/remover
-    /// edges — a topologia do canvas é a fonte de verdade que chega ao agente.
+    /// Atualiza as instruções internas de um agente em execução com a topologia
+    /// atual. Nunca escreve no PTY nem aparece como mensagem de usuário.
     pub fn announce_peers_to(&self, agent_id: &str) {
-        let (workspace_id, banner) = {
+        let (workspace_id, context) = {
             let guard = self.workspace.lock().expect("workspace mutex poisoned");
             let Some(agent) = guard.agents.iter().find(|agent| agent.id == agent_id) else {
                 return;
@@ -630,15 +630,14 @@ impl AppState {
             }
             (
                 guard.metadata.id.clone(),
-                build_peers_banner(&guard.agents, &guard.edges, agent_id),
+                build_maestro_context(&guard.metadata.id, &guard.agents, &guard.edges, agent_id)
+                    .expect("agent was found while building Maestro context"),
             )
         };
-        // A notícia de identidade é sempre enviada (mesmo sem peers): todo
-        // agente CLI precisa saber que roda dentro do MAESTRO 2.0.
         if self.processes.is_running_in(&workspace_id, agent_id) {
             let _ = self
                 .processes
-                .send_input_in(&workspace_id, agent_id, &pty_submission(&banner));
+                .update_maestro_context_in(&workspace_id, agent_id, &context);
         }
     }
 
@@ -777,8 +776,7 @@ impl AppState {
             self.persist().map_err(|e| format!("falha ao persistir edge: {e}"))?;
         }
 
-        // Handshake nativo: anuncia peers para ambos os agentes (se suportam protocolo)
-        // Isso injeta o contexto de peers via bridge IPC da Fase 4
+        // Atualiza o contexto interno de ambos os agentes sem escrever no chat.
         self.announce_peers_to(&source_agent.id);
         self.announce_peers_to(&target_agent.id);
 

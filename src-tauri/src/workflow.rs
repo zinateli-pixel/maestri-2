@@ -13,16 +13,16 @@
 //! 4. Retry se configurado e falhou.
 //! 5. Cancela se flag global setada.
 
-use crate::models::{Agent, AgentKind, Status};
+use crate::models::{Agent, AgentKind};
 use crate::process_manager::ProcessManager;
-use crate::runtime::{ProcessHandle, RuntimeError};
+use crate::runtime::RuntimeError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 /// ID único gerado com timestamp + contador.
 pub fn gen_id(prefix: &str) -> String {
@@ -318,25 +318,14 @@ impl NodeExecutor for ProcessNodeExecutor {
         let output_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let output_buf_clone = output_buf.clone();
 
-        let app_started = app.clone();
-        let app_output = app.clone();
-        let app_exit = app.clone();
-        let app_error = app.clone();
         let agent_id = agent.id.clone();
-        let agent_id_for_output = agent_id.clone();
-        let agent_id_for_exit = agent_id.clone();
 
-        let handle = crate::runtime::adapter_for(agent.runtime).start(
+        // Usa o mesmo ponto de nascimento do start manual: bridge, contexto
+        // interno e isolamento são instalados antes do primeiro prompt.
+        self.process_manager.start_observed(
+            app,
             agent,
-            Box::new(move |text| {
-                // Encaminha para frontend (evento existente)
-                let _ = app_output.emit(
-                    "agent_output",
-                    crate::process_manager::AgentEvent {
-                        agent_id: agent_id_for_output.clone(),
-                        data: text.clone(),
-                    },
-                );
+            Some(Box::new(move |text| {
                 // Acumula no buffer para tail
                 let mut buf = output_buf_clone.lock().unwrap();
                 buf.extend_from_slice(text.as_bytes());
@@ -345,40 +334,11 @@ impl NodeExecutor for ProcessNodeExecutor {
                     let excess = buf.len() - 65536;
                     buf.drain(0..excess);
                 }
-            }),
-            Box::new(move |status| {
-                let _ = app_exit.emit(
-                    "agent_stopped",
-                    crate::process_manager::AgentEvent {
-                        agent_id: agent_id_for_exit.clone(),
-                        data: status.to_string(),
-                    },
-                );
+            })),
+            Some(Box::new(move |status| {
                 let _ = tx.send(status as i32);
-            }),
+            })),
         )?;
-
-        // Registra handle no ProcessManager
-        {
-            let mut guard = self.process_manager.processes.lock().unwrap();
-            guard.insert(agent_id.clone(), handle);
-        }
-
-        let _ = app_started.emit(
-            "agent_started",
-            crate::process_manager::AgentEvent {
-                agent_id: agent_id.clone(),
-                data: String::new(),
-            },
-        );
-
-        let _ = app_error.emit(
-            "agent_status_changed",
-            crate::process_manager::AgentEvent {
-                agent_id: agent_id.clone(),
-                data: Status::Running.as_str().to_string(),
-            },
-        );
 
         Ok(Box::new(ProcessExitWatcher {
             agent_id,

@@ -3,6 +3,7 @@
 //! e por emitir eventos Tauri para o frontend.
 
 use crate::context_router::{supports_agent_protocol, ProtocolDirective, ProtocolScanner};
+use crate::maestro_context::{build_maestro_context, MaestroContextFile};
 use crate::models::{Agent, Status};
 use crate::state::AgentBusMessage;
 use crate::runtime::{adapter_for, ProcessHandle, RuntimeError};
@@ -16,25 +17,6 @@ pub const EVENT_AGENT_OUTPUT: &str = "agent_output";
 pub const EVENT_AGENT_STOPPED: &str = "agent_stopped";
 pub const EVENT_AGENT_ERROR: &str = "agent_error";
 pub const EVENT_AGENT_STATUS_CHANGED: &str = "agent_status_changed";
-
-/// Atraso base (ms) antes de injetar a mensagem de descoberta de peers no
-/// agente. Dá tempo para a TUI (opencode/claude/cline/kilo) terminar de iniciar
-/// e ficar no prompt, evitando que o texto seja descartado durante o boot.
-pub const DISCOVERY_INJECT_DELAY_MS: u64 = 2000;
-
-/// Número máximo de tentativas de reanúncio da descoberta após o boot.
-/// Valor FINITO: impede loop/spam infinito de injeção no stdin do agente.
-pub const DISCOVERY_MAX_ATTEMPTS: usize = 3;
-
-/// Sequência de atrasos (ms) das tentativas de descoberta. A primeira ocorre
-/// após `DISCOVERY_INJECT_DELAY_MS`, e cada tentativa seguinte soma o atraso
-/// base (backoff linear), cobrindo boot lento da TUI sem nunca repetir para
-/// sempre. Total de `DISCOVERY_MAX_ATTEMPTS` itens, sempre crescentes e > 0.
-pub fn discovery_attempt_delays() -> Vec<u64> {
-    (0..DISCOVERY_MAX_ATTEMPTS)
-        .map(|i| DISCOVERY_INJECT_DELAY_MS.saturating_mul(i as u64 + 1))
-        .collect()
-}
 
 /// Payload de evento genérico: `{ agentId, data }`.
 #[derive(Clone, serde::Serialize)]
@@ -79,20 +61,50 @@ impl ProcessManager {
 
     /// Inicia o processo de um agente e emite eventos de saída/saída.
     pub fn start(&self, app: &AppHandle, agent: &Agent) -> Result<(), RuntimeError> {
+        self.start_observed(app, agent, None, None)
+    }
+
+    /// Mesmo ciclo central de nascimento, com observadores adicionais usados
+    /// pelo workflow. Nenhum chamador deve fazer spawn de agente por fora daqui.
+    pub fn start_observed(
+        &self,
+        app: &AppHandle,
+        agent: &Agent,
+        observe_output: Option<Box<dyn Fn(String) + Send>>,
+        observe_exit: Option<Box<dyn Fn(u32) + Send>>,
+    ) -> Result<(), RuntimeError> {
         let agent_id = agent.id.clone();
 
         // Rastreia o workspace ao qual este processo pertence (isolamento).
-        let workspace_id = app
+        let (workspace_id, initial_context) = app
             .try_state::<crate::state::AppState>()
-            .map(|s| {
-                s.workspace
-                    .lock()
-                    .expect("workspace mutex poisoned")
-                    .metadata
-                    .id
-                    .clone()
+            .and_then(|state| {
+                let workspace = state.workspace.lock().expect("workspace mutex poisoned");
+                build_maestro_context(
+                    &workspace.metadata.id,
+                    &workspace.agents,
+                    &workspace.edges,
+                    &agent_id,
+                )
+                .map(|context| (workspace.metadata.id.clone(), context))
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                let agents = vec![agent.clone()];
+                (
+                    String::new(),
+                    build_maestro_context("", &agents, &[], &agent_id)
+                        .expect("agent clone must build context"),
+                )
+            });
+
+        // É criado antes do spawn para que o primeiro request do modelo já
+        // receba identidade, workspace e topologia pelo canal de sistema.
+        let maestro_context = MaestroContextFile::create(
+            &workspace_id,
+            &agent_id,
+            &initial_context,
+        )
+        .map_err(RuntimeError)?;
 
         if let Some(state) = app.try_state::<crate::state::AppState>() {
             state.clear_protocol_ready(&workspace_id, &agent_id);
@@ -158,9 +170,10 @@ impl ProcessManager {
         #[cfg(not(unix))]
         let bridge_env: Vec<(String, String)> = Vec::new();
 
-        let mut handle = adapter_for(agent.runtime).start_with_env(
+        let mut handle = adapter_for(agent.runtime).start_with_maestro_context(
             agent,
             &bridge_env,
+            maestro_context.path(),
             Box::new(move |text| {
                 let agent_id = id_output.clone();
 
@@ -206,6 +219,10 @@ impl ProcessManager {
                     return;
                 }
 
+                if let Some(observer) = observe_output.as_ref() {
+                    observer(forward.clone());
+                }
+
                 // Mantém o output no barramento interno para que
                 // o orquestrador possa consultar o histórico.
                 // O State é obtido através do AppHandle.
@@ -229,6 +246,9 @@ impl ProcessManager {
                 );
             }),
             Box::new(move |status| {
+                if let Some(observer) = observe_exit.as_ref() {
+                    observer(status);
+                }
                 let _ = app_exit.emit(
                     EVENT_AGENT_STOPPED,
                     AgentEvent {
@@ -243,6 +263,7 @@ impl ProcessManager {
         if let Some(bridge) = bridge {
             handle.attach_bridge(bridge);
         }
+        handle.attach_maestro_context(maestro_context);
 
         // Registra o handle.
         {
@@ -271,40 +292,23 @@ impl ProcessManager {
             },
         );
 
-        // Descoberta (Fase 4): anuncia ao agente, APÓS a TUI terminar de iniciar,
-        // a identidade do MAESTRO 2.0 e seus peers conectados. O atraso evita que
-        // a mensagem seja descartada durante o boot da TUI; o reanúncio é FINITO
-        // (DISCOVERY_MAX_ATTEMPTS) com backoff crescente, sem loop/spam infinito.
-        {
-            let app_for_banner = app.clone();
-            let id_for_banner = agent_id.clone();
-            std::thread::spawn(move || {
-                for delay in discovery_attempt_delays() {
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
-                    if let Some(state) = app_for_banner.try_state::<crate::state::AppState>() {
-                        // Interrompe se o processo não pertence mais ao workspace
-                        // atual (parou ou trocou de workspace) — sem entregar a
-                        // notícia a um processo de outro workspace.
-                        let running = state
-                            .current_workspace_id()
-                            .map(|ws| state.processes.is_running_in(&ws, &id_for_banner))
-                            .unwrap_or(false);
-                        if !running {
-                            break;
-                        }
-                        // O handshake veio pelo socket privado: não injete mais
-                        // banners no TUI e não corrompa prompts em andamento.
-                        let workspace_id = state.current_workspace_id().unwrap_or_default();
-                        if state.is_protocol_ready(&workspace_id, &id_for_banner) {
-                            break;
-                        }
-                        state.announce_peers_to(&id_for_banner);
-                    }
-                }
-            });
-        }
-
         Ok(())
+    }
+
+    /// Atualiza o arquivo de instruções internas do processo, isolado pelo
+    /// workspace. Não escreve no PTY e portanto não cria mensagem no chat.
+    pub fn update_maestro_context_in(
+        &self,
+        workspace_id: &str,
+        agent_id: &str,
+        context: &str,
+    ) -> Result<(), RuntimeError> {
+        self.assert_workspace(workspace_id, agent_id)?;
+        let guard = self.processes.lock().expect("processes mutex poisoned");
+        let handle = guard
+            .get(agent_id)
+            .ok_or_else(|| RuntimeError("agente não está em execução".to_string()))?;
+        handle.update_maestro_context(context)
     }
 
     /// Envia input ao processo de um agente.
@@ -486,20 +490,4 @@ mod tests {
         assert!(pm.resize_in("ws-A", "agent-x", 80, 24).is_err());
     }
 
-    #[test]
-    fn discovery_retry_schedule_is_finite_and_increasing() {
-        let delays = discovery_attempt_delays();
-
-        // Exatamente o número máximo de tentativas (nunca infinito).
-        assert_eq!(delays.len(), DISCOVERY_MAX_ATTEMPTS);
-
-        // Atrasos estritamente crescentes => backoff sem loop fechado.
-        assert!(delays.windows(2).all(|w| w[0] < w[1]));
-
-        // O primeiro tenta após o atraso base da TUI.
-        assert_eq!(delays[0], DISCOVERY_INJECT_DELAY_MS);
-
-        // Todos positivos (nada de sleep zero/tight loop).
-        assert!(delays.iter().all(|&d| d > 0));
-    }
 }

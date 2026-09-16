@@ -9,6 +9,7 @@ mod events;
 mod history;
 mod mcp;
 mod memory;
+mod maestro_context;
 mod models;
 mod persistence;
 mod permissions;

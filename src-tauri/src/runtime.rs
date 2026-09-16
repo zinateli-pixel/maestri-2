@@ -66,6 +66,8 @@ pub struct ProcessHandle {
     /// Canal IPC agent→Maestro 2. Não depende do stdout ANSI da TUI.
     #[cfg(unix)]
     bridge: Option<crate::agent_bridge::BridgeServer>,
+    /// Arquivo de instruções internas do Maestro conectado ao runtime.
+    maestro_context: Option<crate::maestro_context::MaestroContextFile>,
 }
 
 impl ProcessHandle {
@@ -133,6 +135,21 @@ impl ProcessHandle {
             .map(|s| s.exit_code())
             .map_err(|e| RuntimeError(e.to_string()))
     }
+
+    pub fn attach_maestro_context(
+        &mut self,
+        context: crate::maestro_context::MaestroContextFile,
+    ) {
+        self.maestro_context = Some(context);
+    }
+
+    pub fn update_maestro_context(&self, context: &str) -> Result<(), RuntimeError> {
+        self.maestro_context
+            .as_ref()
+            .ok_or_else(|| RuntimeError("processo sem contexto interno do Maestro".to_string()))?
+            .update(context)
+            .map_err(RuntimeError)
+    }
 }
 
 /// Trait que todo runtime deve implementar.
@@ -155,20 +172,98 @@ pub trait RuntimeAdapter: Send + Sync {
         spawn_pty(&spec, on_output, on_exit)
     }
 
-    /// Inicia o runtime adicionando variáveis controladas pelo ProcessManager.
-    /// Usado pelo bridge privado do Maestro 2 sem alterar a configuração lógica
-    /// persistida do agente.
-    fn start_with_env(
+    /// Inicia o runtime com o bridge e o bootstrap ligados ao canal nativo de
+    /// instruções do CLI, nunca ao stdin/PTY usado pelas mensagens do usuário.
+    fn start_with_maestro_context(
         &self,
         agent: &Agent,
         extra_env: &[(String, String)],
+        context_path: &std::path::Path,
         on_output: Box<dyn Fn(String) + Send>,
         on_exit: Box<dyn Fn(u32) + Send>,
     ) -> Result<ProcessHandle, RuntimeError> {
         let mut spec = self.resolve(agent)?;
         spec.env.extend_from_slice(extra_env);
+        apply_maestro_context(&mut spec, agent, context_path)?;
         spawn_pty(&spec, on_output, on_exit)
     }
+}
+
+fn apply_maestro_context(
+    spec: &mut SpawnSpec,
+    agent: &Agent,
+    context_path: &std::path::Path,
+) -> Result<(), RuntimeError> {
+    let path = context_path
+        .to_str()
+        .ok_or_else(|| RuntimeError("caminho de contexto inválido".to_string()))?;
+    spec.env.push(("MAESTRO2_CONTEXT_PATH".to_string(), path.to_string()));
+
+    let effective_runtime = if agent.runtime == Runtime::Custom {
+        match std::path::Path::new(agent.command.trim())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "kilo" => Runtime::Kilo,
+            "opencode" => Runtime::OpenCode,
+            "claude" => Runtime::ClaudeCode,
+            "codex" => Runtime::Codex,
+            _ => Runtime::Custom,
+        }
+    } else {
+        agent.runtime
+    };
+
+    match effective_runtime {
+        Runtime::Kilo => append_instruction_config(spec, "KILO_CONFIG_CONTENT", path),
+        Runtime::OpenCode => append_instruction_config(spec, "OPENCODE_CONFIG_CONTENT", path),
+        Runtime::ClaudeCode => {
+            let mut args = vec!["--append-system-prompt-file".to_string(), path.to_string()];
+            args.append(&mut spec.args);
+            spec.args = args;
+            Ok(())
+        }
+        Runtime::Codex => {
+            let toml_path = serde_json::to_string(path).map_err(|error| RuntimeError(error.to_string()))?;
+            let mut args = vec!["-c".to_string(), format!("model_instructions_file={toml_path}")];
+            args.append(&mut spec.args);
+            spec.args = args;
+            Ok(())
+        }
+        // Shells customizados recebem apenas MAESTRO2_CONTEXT_PATH. Não se
+        // inventa uma flag que o executável arbitrário talvez interprete como
+        // prompt/mensagem do usuário.
+        Runtime::Custom => Ok(()),
+    }
+}
+
+fn append_instruction_config(
+    spec: &mut SpawnSpec,
+    variable: &str,
+    context_path: &str,
+) -> Result<(), RuntimeError> {
+    let inherited = std::env::var(variable).unwrap_or_else(|_| "{}".to_string());
+    let mut value = serde_json::from_str::<serde_json::Value>(&inherited)
+        .map_err(|error| RuntimeError(format!("{variable} inválido: {error}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError(format!("{variable} deve ser um objeto JSON")))?;
+    let instructions = object
+        .entry("instructions")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| RuntimeError(format!("{variable}.instructions deve ser um array")))?;
+    if !instructions.iter().any(|entry| entry.as_str() == Some(context_path)) {
+        instructions.push(serde_json::Value::String(context_path.to_string()));
+    }
+    spec.env.push((
+        variable.to_string(),
+        serde_json::to_string(&value).map_err(|error| RuntimeError(error.to_string()))?,
+    ));
+    Ok(())
 }
 
 /// Verifica se `cmd` existe no PATH. Usado APENAS para validar a
@@ -328,6 +423,7 @@ fn spawn_pty(
         reader: Some(reader_handle),
         #[cfg(unix)]
         bridge: None,
+        maestro_context: None,
     })
 }
 
@@ -500,6 +596,87 @@ mod tests {
         // working_dir vazio => None (não passa cwd).
         let b = runtime_agent(Runtime::Kilo, "kilo");
         assert!(KiloAdapter.resolve(&b).unwrap().working_dir.is_none());
+    }
+
+    #[test]
+    fn bootstrap_uses_internal_runtime_channels_not_a_user_prompt() {
+        let path = std::path::Path::new("/tmp/maestro context.md");
+
+        let mut kilo = KiloAdapter.resolve(&runtime_agent(Runtime::Kilo, "kilo")).unwrap();
+        let kilo_agent = runtime_agent(Runtime::Kilo, "kilo");
+        apply_maestro_context(&mut kilo, &kilo_agent, path).unwrap();
+        assert!(kilo.args.is_empty());
+        let config = kilo.env.iter().find(|(key, _)| key == "KILO_CONFIG_CONTENT").unwrap();
+        assert!(config.1.contains("/tmp/maestro context.md"));
+
+        let mut opencode = OpenCodeAdapter.resolve(&runtime_agent(Runtime::OpenCode, "opencode")).unwrap();
+        let opencode_agent = runtime_agent(Runtime::OpenCode, "opencode");
+        apply_maestro_context(&mut opencode, &opencode_agent, path).unwrap();
+        assert!(opencode.env.iter().any(|(key, value)| key == "OPENCODE_CONFIG_CONTENT" && value.contains("instructions")));
+
+        let mut claude = ClaudeCodeAdapter.resolve(&runtime_agent(Runtime::ClaudeCode, "claude")).unwrap();
+        let claude_agent = runtime_agent(Runtime::ClaudeCode, "claude");
+        apply_maestro_context(&mut claude, &claude_agent, path).unwrap();
+        assert_eq!(&claude.args[..2], &["--append-system-prompt-file", "/tmp/maestro context.md"]);
+
+        let mut codex = CodexAdapter.resolve(&runtime_agent(Runtime::Codex, "codex")).unwrap();
+        let codex_agent = runtime_agent(Runtime::Codex, "codex");
+        apply_maestro_context(&mut codex, &codex_agent, path).unwrap();
+        assert_eq!(codex.args[0], "-c");
+        assert!(codex.args[1].starts_with("model_instructions_file="));
+        assert!(!codex.args.iter().any(|arg| arg == "MAESTRO 2.0 INTERNAL RUNTIME CONTEXT"));
+
+        let custom_codex_agent = runtime_agent(Runtime::Custom, "/usr/local/bin/codex");
+        let mut custom_codex = LocalShellAdapter.resolve(&custom_codex_agent).unwrap();
+        apply_maestro_context(&mut custom_codex, &custom_codex_agent, path).unwrap();
+        assert!(custom_codex.args[1].starts_with("model_instructions_file="));
+    }
+
+    #[test]
+    fn real_spawn_receives_bootstrap_before_separate_user_input() {
+        let context = crate::maestro_context::MaestroContextFile::create(
+            "ws-real",
+            "agent-real",
+            "INTERNAL_BOOTSTRAP_SENTINEL",
+        )
+        .unwrap();
+        let mut agent = runtime_agent(Runtime::Kilo, "sh");
+        agent.args = vec![
+            "-c".to_string(),
+            "printf 'PATH=%s\\nCONFIG=%s\\n' \"$MAESTRO2_CONTEXT_PATH\" \"$KILO_CONFIG_CONTENT\"; cat \"$MAESTRO2_CONTEXT_PATH\"; read line; printf 'USER=%s\\n' \"$line\"; sleep 30".to_string(),
+        ];
+
+        let output = Arc::new(Mutex::new(String::new()));
+        let output_for_process = Arc::clone(&output);
+        let mut handle = KiloAdapter
+            .start_with_maestro_context(
+                &agent,
+                &[],
+                context.path(),
+                Box::new(move |text| output_for_process.lock().unwrap().push_str(&text)),
+                Box::new(|_| {}),
+            )
+            .unwrap();
+        handle.attach_maestro_context(context);
+
+        wait_for(
+            &output,
+            "INTERNAL_BOOTSTRAP_SENTINEL",
+            "processo não recebeu o bootstrap interno",
+        );
+        let before_user = output.lock().unwrap().clone();
+        assert!(before_user.contains("CONFIG={"));
+        assert!(before_user.contains("instructions"));
+        assert!(before_user.contains("maestro2-context-"));
+        assert!(!before_user.contains("USER=hello-normal"));
+
+        handle.write_input(b"hello-normal\n").unwrap();
+        wait_for(
+            &output,
+            "USER=hello-normal",
+            "mensagem normal não seguiu pelo stdin separado",
+        );
+        handle.kill().unwrap();
     }
 
     #[test]
